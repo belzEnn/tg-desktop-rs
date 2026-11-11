@@ -51,6 +51,7 @@ pub(crate) struct Adapter {
 
 enum BackendCommand {
     Initialize,
+    LogOut,
     SubmitPhone(String),
     SubmitCode(String),
     SubmitPassword(String),
@@ -157,6 +158,14 @@ impl Adapter {
             .map_err(|_| AdapterCommandError::WorkerStopped)
     }
 
+    /// Requests a proper Telegram logout; TDLib reports completion as `Closed`.
+    pub(crate) async fn log_out(&self) -> Result<(), AdapterCommandError> {
+        self.commands
+            .send(BackendCommand::LogOut)
+            .await
+            .map_err(|_| AdapterCommandError::WorkerStopped)
+    }
+
     /// Sends a phone number to TDLib without exposing backend types to the app.
     pub(crate) async fn submit_phone(&self, phone: String) -> Result<(), AdapterCommandError> {
         self.send_authorization_command(BackendCommand::SubmitPhone(phone))
@@ -228,7 +237,7 @@ fn receive_updates(
 }
 
 async fn run_supervisor(
-    client_id: i32,
+    initial_client_id: i32,
     use_test_dc: bool,
     credentials: Option<(i32, String)>,
     data_dir: PathBuf,
@@ -236,12 +245,25 @@ async fn run_supervisor(
     mut updates: mpsc::Receiver<(tdlib_rs::enums::Update, i32)>,
     events: mpsc::Sender<BackendEvent>,
 ) {
+    let mut client_id = initial_client_id;
+    let mut client_closed = false;
     loop {
         tokio::select! {
             command = commands.recv() => match command {
                 Some(BackendCommand::Initialize) => {
+                    if client_closed {
+                        client_id = tdlib_rs::create_client();
+                        client_closed = false;
+                    }
                     if tdlib_rs::functions::set_log_verbosity_level(2, client_id).await.is_err() {
                         warn!("could not lower TDLib log verbosity");
+                    }
+                }
+                Some(BackendCommand::LogOut) => {
+                    if let Err(error) = tdlib_rs::functions::log_out(client_id).await {
+                        let _ = events.send(BackendEvent::AuthorizationError(
+                            mapping::authorization_error(error.message),
+                        )).await;
                     }
                 }
                 Some(BackendCommand::SubmitPhone(phone)) => {
@@ -274,6 +296,9 @@ async fn run_supervisor(
             update = updates.recv() => match update {
                 Some((update, update_client_id)) if update_client_id == client_id => {
                     if let Some(state) = mapping::authorization_state(&update) {
+                        if state == AuthorizationState::Closed {
+                            client_closed = true;
+                        }
                         if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                             break;
                         }

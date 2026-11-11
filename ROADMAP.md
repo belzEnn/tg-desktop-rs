@@ -55,7 +55,7 @@ measurements.
 - **1.2 Login flow.** ✅ Phone → code → 2FA screens driven by authorization
   events, not by button presses; inline errors; registration shows an
   "unsupported" message.
-- **1.3 Session persistence and logout.** ☐ Restart without a new login;
+- **1.3 Session persistence and logout.** ✅ Restart without a new login;
   logout waits for the closed state and returns to the login screen.
   **Gate B**: if login does not work three weeks after the start, revisit the
   backend choice or the scope.

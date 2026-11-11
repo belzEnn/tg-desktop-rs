@@ -74,8 +74,14 @@ cleared after submission and on authorization changes. Authorization errors
 are converted to fixed display messages, so TDLib error text is not retained.
 No media, message history, or unbounded cache is added by this slice.
 
-RSS measurements after login, opening a chat, and one idle hour remain pending:
-this environment has no `LOCAL_TDLIB_PATH`, which the pinned `tdlib-rs`
-`local-tdlib` build requires. The check commands stop in the dependency build
-script before compiling the application. Measure these scenarios against the
-Telegram test server once the local TDLib directory is configured.
+RSS measurements after login, opening a chat, and one idle hour remain pending.
+Measure these scenarios against the Telegram test server with a test account.
+
+## Session persistence and logout (Phase 1.3)
+
+TDLib's database directory remains under the configured application data
+directory, allowing a session to resume after a restart. Logout uses TDLib's
+proper `logOut` request, which removes local session data and closes the client;
+the application waits for the resulting `Closed` authorization state before it
+starts a fresh TDLib client and returns to phone authorization. This adds no
+in-memory cache. RSS measurements on an authenticated session remain pending.

@@ -60,6 +60,11 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
         }
         Some(AuthorizationState::Ready) => {
             content = content.push(text("Signed in"));
+            if state.logout_pending() {
+                content = content.push(text("Logging out…"));
+            } else {
+                content = content.push(button("Log out").on_press(app::Message::LogOut));
+            }
         }
         Some(AuthorizationState::Closed) => {
             content = content.push(text("Telegram connection closed"));

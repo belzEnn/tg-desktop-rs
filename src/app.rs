@@ -15,6 +15,7 @@ pub(crate) struct State {
     code: String,
     password: String,
     authorization_error: Option<String>,
+    logout_pending: bool,
 }
 
 /// Messages handled by the application update loop.
@@ -29,6 +30,8 @@ pub(crate) enum Message {
     SubmitCode,
     SubmitPassword,
     AuthorizationCommandSent(Result<(), AdapterCommandError>),
+    LogOut,
+    LogoutCommandSent(Result<(), AdapterCommandError>),
 }
 
 /// Creates application state and starts the backend through an iced task.
@@ -40,6 +43,7 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
         code: String::new(),
         password: String::new(),
         authorization_error: None,
+        logout_pending: false,
     };
     let task = Task::perform(
         async move { backend.initialize().await },
@@ -57,6 +61,16 @@ pub(crate) fn subscription(state: &State) -> Subscription<Message> {
 pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::BackendEvent(BackendEvent::AuthorizationChanged(authorization_state)) => {
+            if authorization_state == AuthorizationState::Closed {
+                state.authorization_state = None;
+                state.authorization_error = None;
+                state.logout_pending = false;
+                let backend = state.backend.clone();
+                return Task::perform(
+                    async move { backend.initialize().await },
+                    Message::Initialized,
+                );
+            }
             state.authorization_state = Some(authorization_state);
             state.authorization_error = None;
             if authorization_state != AuthorizationState::WaitPhoneNumber {
@@ -76,6 +90,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::BackendEvent(BackendEvent::AuthorizationError(error)) => {
             state.authorization_error = Some(error);
             state.password.clear();
+            state.logout_pending = false;
         }
         Message::Initialized(Ok(())) => {}
         Message::Initialized(Err(error)) => {
@@ -121,6 +136,23 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 Message::AuthorizationCommandSent,
             );
         }
+        Message::LogOut => {
+            if state.authorization_state == Some(AuthorizationState::Ready) && !state.logout_pending
+            {
+                state.logout_pending = true;
+                state.authorization_error = None;
+                let backend = state.backend.clone();
+                return Task::perform(
+                    async move { backend.log_out().await },
+                    Message::LogoutCommandSent,
+                );
+            }
+        }
+        Message::LogoutCommandSent(Err(error)) => {
+            state.logout_pending = false;
+            state.authorization_error = Some(error.to_string());
+        }
+        Message::LogoutCommandSent(Ok(())) => {}
         Message::AuthorizationCommandSent(Err(error)) => {
             state.authorization_error = Some(error.to_string());
         }
@@ -144,5 +176,8 @@ impl State {
     }
     pub(crate) fn authorization_error(&self) -> Option<&str> {
         self.authorization_error.as_deref()
+    }
+    pub(crate) fn logout_pending(&self) -> bool {
+        self.logout_pending
     }
 }
