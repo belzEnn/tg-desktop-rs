@@ -24,6 +24,7 @@ static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const UPDATE_CHANNEL_CAPACITY: usize = 64;
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
+const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Errors raised while starting the TDLib adapter.
 #[derive(Debug, Error)]
@@ -48,9 +49,11 @@ pub(crate) struct Adapter {
     events: SubscriptionSource,
 }
 
-#[derive(Debug)]
 enum BackendCommand {
     Initialize,
+    SubmitPhone(String),
+    SubmitCode(String),
+    SubmitPassword(String),
 }
 
 struct SubscriptionSource {
@@ -154,6 +157,37 @@ impl Adapter {
             .map_err(|_| AdapterCommandError::WorkerStopped)
     }
 
+    /// Sends a phone number to TDLib without exposing backend types to the app.
+    pub(crate) async fn submit_phone(&self, phone: String) -> Result<(), AdapterCommandError> {
+        self.send_authorization_command(BackendCommand::SubmitPhone(phone))
+            .await
+    }
+
+    /// Sends a login code to TDLib without exposing backend types to the app.
+    pub(crate) async fn submit_code(&self, code: String) -> Result<(), AdapterCommandError> {
+        self.send_authorization_command(BackendCommand::SubmitCode(code))
+            .await
+    }
+
+    /// Sends a 2FA password to TDLib without exposing backend types to the app.
+    pub(crate) async fn submit_password(
+        &self,
+        password: String,
+    ) -> Result<(), AdapterCommandError> {
+        self.send_authorization_command(BackendCommand::SubmitPassword(password))
+            .await
+    }
+
+    async fn send_authorization_command(
+        &self,
+        command: BackendCommand,
+    ) -> Result<(), AdapterCommandError> {
+        self.commands
+            .send(command)
+            .await
+            .map_err(|_| AdapterCommandError::WorkerStopped)
+    }
+
     /// Streams shared authorization events into iced.
     pub(crate) fn subscription(&self) -> Subscription<BackendEvent> {
         Subscription::run_with(self.events.clone(), subscription_stream)
@@ -210,6 +244,31 @@ async fn run_supervisor(
                         warn!("could not lower TDLib log verbosity");
                     }
                 }
+                Some(BackendCommand::SubmitPhone(phone)) => {
+                    if let Err(error) = tdlib_rs::functions::set_authentication_phone_number(
+                        phone,
+                        None,
+                        client_id,
+                    ).await {
+                        let _ = events.send(BackendEvent::AuthorizationError(
+                            mapping::authorization_error(error.message),
+                        )).await;
+                    }
+                }
+                Some(BackendCommand::SubmitCode(code)) => {
+                    if let Err(error) = tdlib_rs::functions::check_authentication_code(code, client_id).await {
+                        let _ = events.send(BackendEvent::AuthorizationError(
+                            mapping::authorization_error(error.message),
+                        )).await;
+                    }
+                }
+                Some(BackendCommand::SubmitPassword(password)) => {
+                    if let Err(error) = tdlib_rs::functions::check_authentication_password(password, client_id).await {
+                        let _ = events.send(BackendEvent::AuthorizationError(
+                            mapping::authorization_error(error.message),
+                        )).await;
+                    }
+                }
                 None => break,
             },
             update = updates.recv() => match update {
@@ -218,13 +277,16 @@ async fn run_supervisor(
                         if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                             break;
                         }
-                        if state == AuthorizationState::WaitTdlibParameters {
-                            configure_tdlib(
+                        if state == AuthorizationState::WaitTdlibParameters
+                            && let Some(error) = configure_tdlib(
                                 client_id,
                                 use_test_dc,
                                 credentials.as_ref(),
                                 &data_dir,
-                            ).await;
+                            ).await {
+                            let _ = events
+                                .send(BackendEvent::AuthorizationError(error.into()))
+                                .await;
                         }
                     }
                 }
@@ -240,16 +302,16 @@ async fn configure_tdlib(
     use_test_dc: bool,
     credentials: Option<&(i32, String)>,
     data_dir: &std::path::Path,
-) {
+) -> Option<&'static str> {
     let Some((api_id, api_hash)) = credentials else {
         warn!("TG_API_ID and TG_API_HASH are required to initialize TDLib");
-        return;
+        return Some("Set TG_API_ID and TG_API_HASH in .env, then restart the app.");
     };
 
     info!("sending TDLib initialization parameters");
     let database_directory = data_dir.to_string_lossy().into_owned();
     match tokio::time::timeout(
-        Duration::from_secs(60),
+        INITIALIZATION_TIMEOUT,
         tdlib_rs::functions::set_tdlib_parameters(
             use_test_dc,
             database_directory,
@@ -270,11 +332,24 @@ async fn configure_tdlib(
     )
     .await
     {
-        Ok(Ok(())) => info!("TDLib accepted its initialization parameters"),
-        Ok(Err(error)) => error!(
-            code = error.code,
-            "TDLib rejected its initialization parameters"
-        ),
-        Err(_) => error!("TDLib did not respond to initialization parameters within 60 seconds"),
+        Ok(Ok(())) => {
+            info!("TDLib accepted its initialization parameters");
+            None
+        }
+        Ok(Err(error)) => {
+            error!(
+                code = error.code,
+                "TDLib rejected its initialization parameters"
+            );
+            Some(
+                "Telegram rejected its initialization parameters. Check the API credentials and test server setting.",
+            )
+        }
+        Err(_) => {
+            error!("TDLib did not respond to initialization parameters within 10 seconds");
+            Some(
+                "Telegram initialization timed out after 10 seconds. Check your connection, then restart the app.",
+            )
+        }
     }
 }

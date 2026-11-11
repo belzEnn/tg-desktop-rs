@@ -11,6 +11,10 @@ use crate::{
 pub(crate) struct State {
     backend: Adapter,
     authorization_state: Option<AuthorizationState>,
+    phone: String,
+    code: String,
+    password: String,
+    authorization_error: Option<String>,
 }
 
 /// Messages handled by the application update loop.
@@ -18,6 +22,13 @@ pub(crate) struct State {
 pub(crate) enum Message {
     BackendEvent(BackendEvent),
     Initialized(Result<(), AdapterCommandError>),
+    PhoneChanged(String),
+    CodeChanged(String),
+    PasswordChanged(String),
+    SubmitPhone,
+    SubmitCode,
+    SubmitPassword,
+    AuthorizationCommandSent(Result<(), AdapterCommandError>),
 }
 
 /// Creates application state and starts the backend through an iced task.
@@ -25,6 +36,10 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
     let state = State {
         backend: backend.clone(),
         authorization_state: None,
+        phone: String::new(),
+        code: String::new(),
+        password: String::new(),
+        authorization_error: None,
     };
     let task = Task::perform(
         async move { backend.initialize().await },
@@ -43,23 +58,91 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::BackendEvent(BackendEvent::AuthorizationChanged(authorization_state)) => {
             state.authorization_state = Some(authorization_state);
+            state.authorization_error = None;
+            if authorization_state != AuthorizationState::WaitPhoneNumber {
+                state.phone.clear();
+            }
+            if authorization_state != AuthorizationState::WaitCode {
+                state.code.clear();
+            }
+            if authorization_state != AuthorizationState::WaitPassword {
+                state.password.clear();
+            }
             tracing::info!(
                 state = authorization_state.as_str(),
                 "Telegram authorization state changed"
             );
         }
+        Message::BackendEvent(BackendEvent::AuthorizationError(error)) => {
+            state.authorization_error = Some(error);
+            state.password.clear();
+        }
         Message::Initialized(Ok(())) => {}
         Message::Initialized(Err(error)) => {
             tracing::error!(%error, "Telegram backend initialization command failed");
         }
+        Message::PhoneChanged(value) => {
+            state.phone = value;
+            state.authorization_error = None;
+        }
+        Message::CodeChanged(value) => {
+            state.code = value;
+            state.authorization_error = None;
+        }
+        Message::PasswordChanged(value) => {
+            state.password = value;
+            state.authorization_error = None;
+        }
+        Message::SubmitPhone => {
+            state.authorization_error = None;
+            let backend = state.backend.clone();
+            let phone = state.phone.trim().to_owned();
+            return Task::perform(
+                async move { backend.submit_phone(phone).await },
+                Message::AuthorizationCommandSent,
+            );
+        }
+        Message::SubmitCode => {
+            state.authorization_error = None;
+            let backend = state.backend.clone();
+            let code = state.code.trim().to_owned();
+            return Task::perform(
+                async move { backend.submit_code(code).await },
+                Message::AuthorizationCommandSent,
+            );
+        }
+        Message::SubmitPassword => {
+            state.authorization_error = None;
+            let backend = state.backend.clone();
+            let password = state.password.clone();
+            state.password.clear();
+            return Task::perform(
+                async move { backend.submit_password(password).await },
+                Message::AuthorizationCommandSent,
+            );
+        }
+        Message::AuthorizationCommandSent(Err(error)) => {
+            state.authorization_error = Some(error.to_string());
+        }
+        Message::AuthorizationCommandSent(Ok(())) => {}
     }
     Task::none()
 }
 
 impl State {
-    pub(crate) fn authorization_status(&self) -> &'static str {
+    pub(crate) fn authorization_state(&self) -> Option<AuthorizationState> {
         self.authorization_state
-            .map(AuthorizationState::as_str)
-            .unwrap_or("starting")
+    }
+    pub(crate) fn phone(&self) -> &str {
+        &self.phone
+    }
+    pub(crate) fn code(&self) -> &str {
+        &self.code
+    }
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+    pub(crate) fn authorization_error(&self) -> Option<&str> {
+        self.authorization_error.as_deref()
     }
 }

@@ -65,3 +65,17 @@ been collected yet. The adapter introduces one TDLib receive thread, one small
 Tokio supervisor runtime, and bounded channels (64 queued updates and events;
 8 queued commands). Record the required after-login, open-chat, and idle-hour
 measurements when the adapter is run against a test account.
+
+## Login flow (Phase 1.2)
+
+The login UI adds three small input strings and one inline-error string to
+application state. The password field is masked and its stored value is
+cleared after submission and on authorization changes. Authorization errors
+are converted to fixed display messages, so TDLib error text is not retained.
+No media, message history, or unbounded cache is added by this slice.
+
+RSS measurements after login, opening a chat, and one idle hour remain pending:
+this environment has no `LOCAL_TDLIB_PATH`, which the pinned `tdlib-rs`
+`local-tdlib` build requires. The check commands stop in the dependency build
+script before compiling the application. Measure these scenarios against the
+Telegram test server once the local TDLib directory is configured.

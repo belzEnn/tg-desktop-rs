@@ -52,7 +52,7 @@ measurements.
   commands as iced `Task`s; test-DC flag from config; backend log level
   lowered. Backend types live only in `src/tg`; conversion only in
   `src/tg/mapping.rs`. Exit: auth states are visible in the log.
-- **1.2 Login flow.** ☐ Phone → code → 2FA screens driven by authorization
+- **1.2 Login flow.** ✅ Phone → code → 2FA screens driven by authorization
   events, not by button presses; inline errors; registration shows an
   "unsupported" message.
 - **1.3 Session persistence and logout.** ☐ Restart without a new login;
