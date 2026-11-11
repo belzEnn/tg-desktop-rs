@@ -1,0 +1,2 @@
+# Application settings. The data directory defaults to the platform data location.
+data_dir = ""
