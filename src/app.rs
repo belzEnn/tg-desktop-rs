@@ -3,7 +3,7 @@
 use iced::{Subscription, Task};
 
 use crate::{
-    domain::{AuthorizationState, BackendEvent},
+    domain::{AuthorizationState, BackendEvent, ChatSummary},
     tg::{Adapter, AdapterCommandError},
 };
 
@@ -16,6 +16,7 @@ pub(crate) struct State {
     password: String,
     authorization_error: Option<String>,
     logout_pending: bool,
+    chats: Vec<ChatSummary>,
 }
 
 /// Messages handled by the application update loop.
@@ -44,6 +45,7 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
         password: String::new(),
         authorization_error: None,
         logout_pending: false,
+        chats: Vec::new(),
     };
     let task = Task::perform(
         async move { backend.initialize().await },
@@ -65,6 +67,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.authorization_state = None;
                 state.authorization_error = None;
                 state.logout_pending = false;
+                state.chats.clear();
                 let backend = state.backend.clone();
                 return Task::perform(
                     async move { backend.initialize().await },
@@ -91,6 +94,27 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.authorization_error = Some(error);
             state.password.clear();
             state.logout_pending = false;
+        }
+        Message::BackendEvent(BackendEvent::ChatUpdated(chat)) => {
+            if let Some(existing) = state
+                .chats
+                .iter_mut()
+                .find(|existing| existing.id == chat.id)
+            {
+                *existing = chat;
+            } else {
+                state.chats.push(chat);
+            }
+            state.chats.sort_by(|left, right| {
+                right
+                    .position
+                    .cmp(&left.position)
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+            state.chats.truncate(50);
+        }
+        Message::BackendEvent(BackendEvent::ChatRemoved(chat_id)) => {
+            state.chats.retain(|chat| chat.id != chat_id);
         }
         Message::Initialized(Ok(())) => {}
         Message::Initialized(Err(error)) => {
@@ -179,5 +203,8 @@ impl State {
     }
     pub(crate) fn logout_pending(&self) -> bool {
         self.logout_pending
+    }
+    pub(crate) fn chats(&self) -> &[ChatSummary] {
+        &self.chats
     }
 }

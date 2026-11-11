@@ -25,6 +25,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 const UPDATE_CHANNEL_CAPACITY: usize = 64;
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
+const CHAT_LIST_LIMIT: i32 = 50;
 
 /// Errors raised while starting the TDLib adapter.
 #[derive(Debug, Error)]
@@ -302,6 +303,13 @@ async fn run_supervisor(
                         if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                             break;
                         }
+                        if state == AuthorizationState::Ready
+                            && let Err(error) = tdlib_rs::functions::load_chats(
+                                Some(tdlib_rs::enums::ChatList::Main), CHAT_LIST_LIMIT, client_id,
+                            ).await
+                        {
+                            warn!(code = error.code, "could not load Telegram chat list");
+                        }
                         if state == AuthorizationState::WaitTdlibParameters
                             && let Some(error) = configure_tdlib(
                                 client_id,
@@ -312,6 +320,26 @@ async fn run_supervisor(
                             let _ = events
                                 .send(BackendEvent::AuthorizationError(error.into()))
                                 .await;
+                        }
+                    }
+                    if let Some(chat_id) = mapping::chat_removed_from_main_list(&update) {
+                        if events.send(BackendEvent::ChatRemoved(chat_id)).await.is_err() {
+                            break;
+                        }
+                    } else if let tdlib_rs::enums::Update::NewChat(new_chat) = &update {
+                        if let Some(chat) = mapping::chat(&new_chat.chat)
+                            && events.send(BackendEvent::ChatUpdated(chat)).await.is_err()
+                        {
+                            break;
+                        }
+                    } else if let Some(chat_id) = mapping::chat_update_id(&update)
+                        && let Ok(td_chat) = tdlib_rs::functions::get_chat(chat_id, client_id).await
+                    {
+                        let tdlib_rs::enums::Chat::Chat(td_chat) = td_chat;
+                        if let Some(chat) = mapping::chat(&td_chat)
+                            && events.send(BackendEvent::ChatUpdated(chat)).await.is_err()
+                        {
+                            break;
                         }
                     }
                 }

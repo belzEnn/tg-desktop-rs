@@ -1,8 +1,72 @@
 //! Conversions from TDLib updates into shared application events.
 
-use tdlib_rs::enums::{AuthorizationState as TdAuthorizationState, Update};
+use tdlib_rs::{
+    enums::{
+        AuthorizationState as TdAuthorizationState, ChatList as TdChatList, MessageContent, Update,
+    },
+    types::Chat,
+};
 
-use crate::domain::AuthorizationState;
+use crate::domain::{AuthorizationState, ChatSummary};
+
+pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
+    let position = chat
+        .positions
+        .iter()
+        .find(|position| position.list == TdChatList::Main)?;
+    Some(ChatSummary {
+        id: chat.id,
+        title: chat.title.clone(),
+        last_message_preview: chat.last_message.as_ref().map_or_else(
+            || "No messages yet".into(),
+            |message| match &message.content {
+                MessageContent::MessageText(text) => text.text.text.clone(),
+                _ => "Unsupported message".into(),
+            },
+        ),
+        unread_count: chat.unread_count.max(0) as u32,
+        position: position.order,
+    })
+}
+
+pub(super) fn chat_update_id(update: &Update) -> Option<i64> {
+    match update {
+        Update::NewChat(update) => Some(update.chat.id),
+        Update::ChatTitle(update) => Some(update.chat_id),
+        Update::ChatLastMessage(update) => Some(update.chat_id),
+        Update::ChatPosition(update) => Some(update.chat_id),
+        Update::ChatAddedToList(update) if update.chat_list == TdChatList::Main => {
+            Some(update.chat_id)
+        }
+        Update::ChatRemovedFromList(update) if update.chat_list == TdChatList::Main => {
+            Some(update.chat_id)
+        }
+        Update::ChatReadInbox(update) => Some(update.chat_id),
+        _ => None,
+    }
+}
+
+pub(super) fn chat_removed_from_main_list(update: &Update) -> Option<i64> {
+    match update {
+        Update::ChatRemovedFromList(update) if update.chat_list == TdChatList::Main => {
+            Some(update.chat_id)
+        }
+        Update::ChatPosition(update)
+            if update.position.list == TdChatList::Main && update.position.order == 0 =>
+        {
+            Some(update.chat_id)
+        }
+        Update::ChatLastMessage(update)
+            if update
+                .positions
+                .iter()
+                .any(|position| position.list == TdChatList::Main && position.order == 0) =>
+        {
+            Some(update.chat_id)
+        }
+        _ => None,
+    }
+}
 
 pub(super) fn authorization_state(update: &Update) -> Option<AuthorizationState> {
     let Update::AuthorizationState(update) = update else {

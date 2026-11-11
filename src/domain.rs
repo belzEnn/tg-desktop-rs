@@ -35,4 +35,18 @@ pub enum BackendEvent {
     AuthorizationChanged(AuthorizationState),
     /// A safe-to-display error from an authorization request.
     AuthorizationError(String),
+    /// A chat in the main list was added or updated.
+    ChatUpdated(ChatSummary),
+    /// A chat was removed from the main list.
+    ChatRemoved(i64),
+}
+
+/// The small amount of chat data needed to render one main-list row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSummary {
+    pub id: i64,
+    pub title: String,
+    pub last_message_preview: String,
+    pub unread_count: u32,
+    pub position: i64,
 }

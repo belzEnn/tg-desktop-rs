@@ -85,3 +85,10 @@ proper `logOut` request, which removes local session data and closes the client;
 the application waits for the resulting `Closed` authorization state before it
 starts a fresh TDLib client and returns to phone authorization. This adds no
 in-memory cache. RSS measurements on an authenticated session remain pending.
+
+## Chat list display (Phase 2.1)
+
+The main chat list retains at most 50 lightweight summaries in application
+state. TDLib loads at most 50 chats for the initial display; no avatars or
+media are downloaded. RSS measurements after login, opening a chat, and one
+idle hour remain pending until the slice is run with a Telegram test account.

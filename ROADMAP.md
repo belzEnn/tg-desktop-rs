@@ -62,7 +62,7 @@ measurements.
 
 ## 2. Chat list
 
-- **2.1 Chat list display.** ☐ Main list sorted by position; title, last
+- **2.1 Chat list display.** ✅ Main list sorted by position; title, last
   message preview (text or placeholder for unsupported content), unread
   counter; first-letter circle instead of avatars.
 - **2.2 Live updates.** ☐ New message moves the chat to the top; unread and

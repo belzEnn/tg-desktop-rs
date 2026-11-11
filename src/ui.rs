@@ -2,7 +2,7 @@
 
 use iced::{
     Element,
-    widget::{button, column, text, text_input},
+    widget::{button, column, container, row, scrollable, text, text_input},
 };
 
 use crate::{app, domain::AuthorizationState, tg::Adapter};
@@ -59,12 +59,67 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
             ));
         }
         Some(AuthorizationState::Ready) => {
-            content = content.push(text("Signed in"));
-            if state.logout_pending() {
-                content = content.push(text("Logging out…"));
-            } else {
-                content = content.push(button("Log out").on_press(app::Message::LogOut));
+            let mut chats = column![].spacing(2);
+            for chat in state.chats() {
+                let preview = single_line_preview(&chat.last_message_preview);
+                let initial = chat
+                    .title
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string();
+                chats = chats.push(
+                    container(
+                        row![
+                            container(text(initial))
+                                .width(40)
+                                .height(40)
+                                .center(40)
+                                .style(|_| iced::widget::container::Style {
+                                    background: Some(iced::Background::Color(
+                                        iced::Color::from_rgb(0.25, 0.42, 0.62,)
+                                    )),
+                                    border: iced::Border::default().rounded(20.0),
+                                    ..Default::default()
+                                }),
+                            column![
+                                text(&chat.title),
+                                text(preview)
+                                    .size(13)
+                                    .width(iced::Length::Fill)
+                                    .wrapping(iced::widget::text::Wrapping::None),
+                            ]
+                            .spacing(4)
+                            .width(iced::Length::Fill),
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .width(iced::Length::Fill)
+                    .padding([8, 12]),
+                );
             }
+            let sidebar = container(scrollable(chats).height(iced::Length::Fill))
+                .width(360)
+                .height(iced::Length::Fill);
+            let chat_area = column![
+                row![
+                    text("").width(iced::Length::Fill),
+                    button(if state.logout_pending() {
+                        "Logging out…"
+                    } else {
+                        "Log out"
+                    })
+                    .on_press(app::Message::LogOut),
+                ]
+                .align_y(iced::Alignment::Center),
+                container(text("")).height(iced::Length::Fill),
+            ]
+            .padding(12)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill);
+            return row![sidebar, chat_area].height(iced::Length::Fill).into();
         }
         Some(AuthorizationState::Closed) => {
             content = content.push(text("Telegram connection closed"));
@@ -81,5 +136,24 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
         content = content.push(text(error));
     }
 
-    content.into()
+    scrollable(content).into()
+}
+
+fn single_line_preview(message: &str) -> String {
+    let mut preview = String::with_capacity(message.len());
+    let mut previous_was_whitespace = true;
+
+    for character in message.chars() {
+        if character.is_whitespace() {
+            if !previous_was_whitespace {
+                preview.push(' ');
+            }
+            previous_was_whitespace = true;
+        } else {
+            preview.push(character);
+            previous_was_whitespace = false;
+        }
+    }
+
+    preview
 }
