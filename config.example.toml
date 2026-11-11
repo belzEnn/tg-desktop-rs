@@ -1,0 +1,5 @@
+# Use Telegram's test environment while developing.
+test_dc = true
+
+# Optional; defaults to the platform's local application data directory.
+# data_dir = "/path/to/tg-desktop-rs"

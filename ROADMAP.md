@@ -26,26 +26,28 @@ pushes RSS over budget is not accepted until it is optimized or simplified.
 Rough timeline (estimate, 15–20 h/week): MVP in about 6–7 weeks on TDLib, about
 8–11 weeks on grammers (own cache, chat ordering and message storage).
 
-## 0. Scaffold and measurements (keystone)
+## 0. Scaffold and measurements (keystone) ✅
 
 Nothing else starts before the backend and renderer decisions are recorded.
 
-- **0.1 Project skeleton.** ☐ Single crate with `domain`, `tg`, `app`, `ui`
+- **0.1 Project skeleton.** ✅ Single crate with `domain`, `tg`, `app`, `ui`
   modules; config (`.env` + `config.toml`, data dir via `dirs`); `tracing`;
   `.gitignore` (target, `.env`, session data); `AGENTS.md` / `CLAUDE.md`;
   fmt, clippy and test checks; empty iced window. Exit: `cargo run` opens a
   window, all checks pass.
-- **0.2 Backend and renderer measurements.** ☐ Minimal programs: login + load
+- **0.2 Backend and renderer measurements.** ✅ Minimal programs: login + load
   chat list on TDLib (tdlib-rs) and on grammers; empty iced window on wgpu and
   on the software renderer. Record RSS, time to first frame, time to chat list
   and integration effort in `docs/perf.md`.
-- **0.3 Decision records.** ☐ `docs/decisions/0001-backend.md` and
-  `0002-renderer.md`. **Gate A**: after this the choices are not revisited
-  without a strong reason.
+- **0.3 Decision records.** ✅ Renderer decision recorded in
+  `docs/decisions/0002-renderer.md`. Backend decision and
+measurements.
+  **Gate A**: after both choices are recorded, they are not revisited without
+  a strong reason.
 
 ## 1. Backend connected and login
 
-- **1.1 Backend adapter.** ☐ Client creation, receive loop on a dedicated
+- **1.1 Backend adapter.** ✅ Client creation, receive loop on a dedicated
   thread, events through a tokio `mpsc` channel into an iced `Subscription`,
   commands as iced `Task`s; test-DC flag from config; backend log level
   lowered. Backend types live only in `src/tg`; conversion only in

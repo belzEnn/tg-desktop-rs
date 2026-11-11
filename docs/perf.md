@@ -57,3 +57,11 @@ the median reported above. The raw values are in
 The experiment verifies a moderately populated UI on the software renderer.
 It does not establish performance with real Telegram data or continuous live
 updates. Backend measurements and a WGPU comparison are not recorded here.
+
+## Backend adapter (Phase 1.1)
+
+RSS and response-time measurements for an authenticated TDLib session have not
+been collected yet. The adapter introduces one TDLib receive thread, one small
+Tokio supervisor runtime, and bounded channels (64 queued updates and events;
+8 queued commands). Record the required after-login, open-chat, and idle-hour
+measurements when the adapter is run against a test account.

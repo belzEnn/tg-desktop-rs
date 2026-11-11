@@ -25,6 +25,12 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to resolve application data directory")?;
     tracing::info!(data_dir = %data_dir.display(), "configuration loaded");
 
-    ui::run()?;
+    let credentials = config
+        .api_credentials()
+        .context("invalid Telegram API credentials")?;
+    let backend = tg::Adapter::new(config.use_test_dc(), credentials, data_dir)
+        .context("failed to start Telegram backend")?;
+
+    ui::run(backend)?;
     Ok(())
 }
