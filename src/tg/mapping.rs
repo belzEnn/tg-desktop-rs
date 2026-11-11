@@ -31,6 +31,7 @@ pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
 
 pub(super) fn chat_update_id(update: &Update) -> Option<i64> {
     match update {
+        Update::NewMessage(update) => Some(update.message.chat_id),
         Update::NewChat(update) => Some(update.chat.id),
         Update::ChatTitle(update) => Some(update.chat_id),
         Update::ChatLastMessage(update) => Some(update.chat_id),
