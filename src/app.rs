@@ -3,7 +3,7 @@
 use iced::{Subscription, Task};
 
 use crate::{
-    domain::{AuthorizationState, BackendEvent, ChatSummary},
+    domain::{AuthorizationState, BackendEvent, ChatMessage, ChatSummary},
     tg::{Adapter, AdapterCommandError},
 };
 
@@ -17,6 +17,10 @@ pub(crate) struct State {
     authorization_error: Option<String>,
     logout_pending: bool,
     chats: Vec<ChatSummary>,
+    open_chat_id: Option<i64>,
+    messages: Vec<ChatMessage>,
+    history_loading: bool,
+    history_error: Option<String>,
 }
 
 /// Messages handled by the application update loop.
@@ -33,6 +37,8 @@ pub(crate) enum Message {
     AuthorizationCommandSent(Result<(), AdapterCommandError>),
     LogOut,
     LogoutCommandSent(Result<(), AdapterCommandError>),
+    OpenChat(i64),
+    ChatOpenCommandSent(Result<(), AdapterCommandError>),
 }
 
 /// Creates application state and starts the backend through an iced task.
@@ -46,6 +52,10 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
         authorization_error: None,
         logout_pending: false,
         chats: Vec::new(),
+        open_chat_id: None,
+        messages: Vec::new(),
+        history_loading: false,
+        history_error: None,
     };
     let task = Task::perform(
         async move { backend.initialize().await },
@@ -68,6 +78,8 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.authorization_error = None;
                 state.logout_pending = false;
                 state.chats.clear();
+                state.open_chat_id = None;
+                state.messages.clear();
                 let backend = state.backend.clone();
                 return Task::perform(
                     async move { backend.initialize().await },
@@ -115,6 +127,19 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::BackendEvent(BackendEvent::ChatRemoved(chat_id)) => {
             state.chats.retain(|chat| chat.id != chat_id);
+        }
+        Message::BackendEvent(BackendEvent::ChatHistoryLoaded { chat_id, messages }) => {
+            if state.open_chat_id == Some(chat_id) {
+                state.messages = messages;
+                state.history_loading = false;
+                state.history_error = None;
+            }
+        }
+        Message::BackendEvent(BackendEvent::ChatHistoryError { chat_id, message }) => {
+            if state.open_chat_id == Some(chat_id) {
+                state.history_loading = false;
+                state.history_error = Some(message);
+            }
         }
         Message::Initialized(Ok(())) => {}
         Message::Initialized(Err(error)) => {
@@ -177,6 +202,24 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.authorization_error = Some(error.to_string());
         }
         Message::LogoutCommandSent(Ok(())) => {}
+        Message::OpenChat(chat_id) => {
+            if state.open_chat_id != Some(chat_id) {
+                state.open_chat_id = Some(chat_id);
+                state.messages.clear();
+                state.history_loading = true;
+                state.history_error = None;
+                let backend = state.backend.clone();
+                return Task::perform(
+                    async move { backend.open_chat(chat_id).await },
+                    Message::ChatOpenCommandSent,
+                );
+            }
+        }
+        Message::ChatOpenCommandSent(Err(error)) => {
+            state.history_loading = false;
+            state.history_error = Some(error.to_string());
+        }
+        Message::ChatOpenCommandSent(Ok(())) => {}
         Message::AuthorizationCommandSent(Err(error)) => {
             state.authorization_error = Some(error.to_string());
         }
@@ -206,5 +249,17 @@ impl State {
     }
     pub(crate) fn chats(&self) -> &[ChatSummary] {
         &self.chats
+    }
+    pub(crate) fn open_chat_id(&self) -> Option<i64> {
+        self.open_chat_id
+    }
+    pub(crate) fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+    pub(crate) fn history_loading(&self) -> bool {
+        self.history_loading
+    }
+    pub(crate) fn history_error(&self) -> Option<&str> {
+        self.history_error.as_deref()
     }
 }

@@ -92,3 +92,11 @@ The main chat list retains at most 50 lightweight summaries in application
 state. TDLib loads at most 50 chats for the initial display; no avatars or
 media are downloaded. RSS measurements after login, opening a chat, and one
 idle hour remain pending until the slice is run with a Telegram test account.
+
+## Open chat and history (Phase 3.1)
+
+Opening a chat tells TDLib which chat is active and requests history in bounded
+pages until up to 50 messages are available. Application state retains only
+the selected chat's messages; switching chats clears the previous history.
+RSS measurements after login, opening a 50-message chat, and one idle hour
+remain pending until measured with a Telegram test account.

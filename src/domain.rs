@@ -39,6 +39,26 @@ pub enum BackendEvent {
     ChatUpdated(ChatSummary),
     /// A chat was removed from the main list.
     ChatRemoved(i64),
+    /// The requested chat history was loaded.
+    ChatHistoryLoaded {
+        chat_id: i64,
+        messages: Vec<ChatMessage>,
+    },
+    /// A chat history request failed with a safe-to-display message.
+    ChatHistoryError {
+        chat_id: i64,
+        message: String,
+    },
+}
+
+/// A message row with backend-independent display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub id: i64,
+    pub date: i32,
+    pub sender_name: String,
+    pub text: String,
+    pub is_outgoing: bool,
 }
 
 /// The small amount of chat data needed to render one main-list row.

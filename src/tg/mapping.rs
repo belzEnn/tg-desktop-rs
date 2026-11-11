@@ -7,7 +7,14 @@ use tdlib_rs::{
     types::Chat,
 };
 
-use crate::domain::{AuthorizationState, ChatSummary};
+use crate::domain::{AuthorizationState, ChatMessage, ChatSummary};
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub(super) enum MessageSenderReference {
+    Outgoing,
+    User(i64),
+    Chat(i64),
+}
 
 pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
     let position = chat
@@ -27,6 +34,56 @@ pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
         unread_count: chat.unread_count.max(0) as u32,
         position: position.order,
     })
+}
+
+pub(super) fn message_sender(message: &tdlib_rs::types::Message) -> MessageSenderReference {
+    if message.is_outgoing {
+        return MessageSenderReference::Outgoing;
+    }
+    match &message.sender_id {
+        tdlib_rs::enums::MessageSender::User(sender) => {
+            MessageSenderReference::User(sender.user_id)
+        }
+        tdlib_rs::enums::MessageSender::Chat(sender) => {
+            MessageSenderReference::Chat(sender.chat_id)
+        }
+    }
+}
+
+pub(super) fn chat_message(message: tdlib_rs::types::Message, sender_name: String) -> ChatMessage {
+    let text = match message.content {
+        MessageContent::MessageText(text) => text.text.text,
+        _ => "Unsupported message".into(),
+    };
+    ChatMessage {
+        id: message.id,
+        date: message.date,
+        sender_name: if message.is_outgoing {
+            "You".into()
+        } else {
+            sender_name
+        },
+        text,
+        is_outgoing: message.is_outgoing,
+    }
+}
+
+pub(super) fn user_name(user: &tdlib_rs::types::User) -> String {
+    let name = format!("{} {}", user.first_name, user.last_name);
+    let name = name.trim();
+    if name.is_empty() {
+        "Unknown sender".into()
+    } else {
+        name.into()
+    }
+}
+
+pub(super) fn chat_title(chat: &Chat) -> String {
+    if chat.title.is_empty() {
+        "Unknown sender".into()
+    } else {
+        chat.title.clone()
+    }
 }
 
 pub(super) fn chat_update_id(update: &Update) -> Option<i64> {

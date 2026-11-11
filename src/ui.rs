@@ -70,39 +70,89 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     .to_uppercase()
                     .to_string();
                 chats = chats.push(
-                    container(
-                        row![
-                            container(text(initial))
-                                .width(40)
-                                .height(40)
-                                .center(40)
-                                .style(|_| iced::widget::container::Style {
-                                    background: Some(iced::Background::Color(
-                                        iced::Color::from_rgb(0.25, 0.42, 0.62,)
-                                    )),
-                                    border: iced::Border::default().rounded(20.0),
-                                    ..Default::default()
-                                }),
-                            column![
-                                text(&chat.title),
-                                text(preview)
-                                    .size(13)
-                                    .width(iced::Length::Fill)
-                                    .wrapping(iced::widget::text::Wrapping::None),
+                    button(
+                        container(
+                            row![
+                                container(text(initial))
+                                    .width(40)
+                                    .height(40)
+                                    .center(40)
+                                    .style(|_: &iced::Theme| iced::widget::container::Style {
+                                        background: Some(iced::Background::Color(
+                                            iced::Color::from_rgb(0.25, 0.42, 0.62,)
+                                        )),
+                                        border: iced::Border::default().rounded(20.0),
+                                        ..Default::default()
+                                    }),
+                                column![
+                                    text(&chat.title),
+                                    text(preview)
+                                        .size(13)
+                                        .width(iced::Length::Fill)
+                                        .wrapping(iced::widget::text::Wrapping::None),
+                                ]
+                                .spacing(4)
+                                .width(iced::Length::Fill),
                             ]
-                            .spacing(4)
-                            .width(iced::Length::Fill),
-                        ]
-                        .spacing(12)
-                        .align_y(iced::Alignment::Center),
+                            .spacing(12)
+                            .align_y(iced::Alignment::Center),
+                        )
+                        .width(iced::Length::Fill)
+                        .padding([8, 12]),
                     )
                     .width(iced::Length::Fill)
-                    .padding([8, 12]),
+                    .style(|theme: &iced::Theme, status| iced::widget::button::Style {
+                        background: match status {
+                            iced::widget::button::Status::Hovered
+                            | iced::widget::button::Status::Pressed => {
+                                Some(iced::Background::Color(iced::Color::from_rgba(
+                                    theme.palette().text.r,
+                                    theme.palette().text.g,
+                                    theme.palette().text.b,
+                                    0.10,
+                                )))
+                            }
+                            _ => None,
+                        },
+                        text_color: theme.palette().text,
+                        border: iced::Border::default().rounded(6.0),
+                        ..Default::default()
+                    })
+                    .on_press(app::Message::OpenChat(chat.id)),
                 );
             }
             let sidebar = container(scrollable(chats).height(iced::Length::Fill))
                 .width(360)
                 .height(iced::Length::Fill);
+            let open_chat = state
+                .open_chat_id()
+                .and_then(|id| state.chats().iter().find(|chat| chat.id == id));
+            let mut history = column![].spacing(8);
+            if let Some(chat) = open_chat {
+                history = history.push(text(&chat.title).size(20));
+                if state.history_loading() {
+                    history = history.push(text("Loading messages…"));
+                } else if state.messages().is_empty() && state.history_error().is_none() {
+                    history = history.push(text("No messages in this chat."));
+                }
+                if let Some(error) = state.history_error() {
+                    history = history.push(text(error));
+                }
+                for message in state.messages() {
+                    history = history.push(
+                        container(
+                            column![
+                                text(&message.sender_name).size(12),
+                                text(&message.text).wrapping(iced::widget::text::Wrapping::Word),
+                            ]
+                            .spacing(3),
+                        )
+                        .padding(10),
+                    );
+                }
+            } else {
+                history = history.push(text("Select a chat to view its messages."));
+            }
             let chat_area = column![
                 row![
                     text("").width(iced::Length::Fill),
@@ -114,7 +164,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     .on_press(app::Message::LogOut),
                 ]
                 .align_y(iced::Alignment::Center),
-                container(text("")).height(iced::Length::Fill),
+                scrollable(history).height(iced::Length::Fill),
             ]
             .padding(12)
             .width(iced::Length::Fill)

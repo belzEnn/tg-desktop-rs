@@ -1,6 +1,7 @@
 //! TDLib client lifecycle and bounded event delivery.
 
 use std::{
+    collections::HashMap,
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
@@ -16,7 +17,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
-use crate::domain::{AuthorizationState, BackendEvent};
+use crate::domain::{AuthorizationState, BackendEvent, ChatMessage};
 
 use super::mapping;
 
@@ -26,6 +27,7 @@ const UPDATE_CHANNEL_CAPACITY: usize = 64;
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHAT_LIST_LIMIT: i32 = 50;
+const CHAT_HISTORY_LIMIT: usize = 50;
 
 /// Errors raised while starting the TDLib adapter.
 #[derive(Debug, Error)]
@@ -56,6 +58,7 @@ enum BackendCommand {
     SubmitPhone(String),
     SubmitCode(String),
     SubmitPassword(String),
+    OpenChat(i64),
 }
 
 struct SubscriptionSource {
@@ -195,6 +198,14 @@ impl Adapter {
             .await
     }
 
+    /// Opens a chat in TDLib and requests its latest messages.
+    pub(crate) async fn open_chat(&self, chat_id: i64) -> Result<(), AdapterCommandError> {
+        self.commands
+            .send(BackendCommand::OpenChat(chat_id))
+            .await
+            .map_err(|_| AdapterCommandError::WorkerStopped)
+    }
+
     async fn send_authorization_command(
         &self,
         command: BackendCommand,
@@ -251,6 +262,7 @@ fn receive_updates(
     tracing::debug!(client_id, "TDLib update receiver stopped");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     initial_client_id: i32,
     use_test_dc: bool,
@@ -321,6 +333,84 @@ async fn run_supervisor(
                             mapping::authorization_error(error.message),
                         )).await;
                     }
+                }
+                Some(BackendCommand::OpenChat(chat_id)) => {
+                    if let Err(error) = tdlib_rs::functions::open_chat(chat_id, client_id).await {
+                        let _ = events.send(BackendEvent::ChatHistoryError {
+                            chat_id,
+                            message: format!("Could not open chat (error {}).", error.code),
+                        }).await;
+                        continue;
+                    }
+                    let mut messages: Vec<ChatMessage> = Vec::with_capacity(CHAT_HISTORY_LIMIT);
+                    let mut sender_names: HashMap<mapping::MessageSenderReference, String> =
+                        HashMap::new();
+                    let mut from_message_id = 0;
+                    let mut first_request = true;
+                    loop {
+                        match tdlib_rs::functions::get_chat_history(
+                            chat_id, from_message_id, 0, CHAT_HISTORY_LIMIT as i32, false, client_id,
+                        ).await {
+                            Ok(tdlib_rs::enums::Messages::Messages(page)) => {
+                                let page_messages: Vec<_> = page.messages.into_iter().flatten().collect();
+                                if page_messages.is_empty() {
+                                    if first_request {
+                                        first_request = false;
+                                        continue;
+                                    }
+                                    break;
+                                }
+                                first_request = false;
+                                let oldest_id = page_messages.iter().map(|message| message.id).min().unwrap_or_default();
+                                let received = page_messages.len();
+                                if from_message_id != 0 && oldest_id >= from_message_id {
+                                    break;
+                                }
+                                for message in page_messages {
+                                    if !messages.iter().any(|loaded| loaded.id == message.id) {
+                                        let sender = mapping::message_sender(&message);
+                                        let sender_name = if let Some(name) = sender_names.get(&sender) {
+                                            name.clone()
+                                        } else {
+                                            let name = match sender {
+                                                mapping::MessageSenderReference::Outgoing => "You".into(),
+                                                mapping::MessageSenderReference::User(user_id) => {
+                                                    match tdlib_rs::functions::get_user(user_id, client_id).await {
+                                                        Ok(tdlib_rs::enums::User::User(user)) => mapping::user_name(&user),
+                                                        Err(_) => "Unknown sender".into(),
+                                                    }
+                                                }
+                                                mapping::MessageSenderReference::Chat(sender_chat_id) => {
+                                                    match tdlib_rs::functions::get_chat(sender_chat_id, client_id).await {
+                                                        Ok(tdlib_rs::enums::Chat::Chat(chat)) => mapping::chat_title(&chat),
+                                                        Err(_) => "Unknown sender".into(),
+                                                    }
+                                                }
+                                            };
+                                            sender_names.insert(sender, name.clone());
+                                            name
+                                        };
+                                        messages.push(mapping::chat_message(message, sender_name));
+                                    }
+                                }
+                                if messages.len() >= CHAT_HISTORY_LIMIT || received >= CHAT_HISTORY_LIMIT || oldest_id == 0 {
+                                    break;
+                                }
+                                from_message_id = oldest_id;
+                            }
+                            Err(error) => {
+                                let _ = events.send(BackendEvent::ChatHistoryError {
+                                    chat_id,
+                                    message: format!("Could not load chat history (error {}).", error.code),
+                                }).await;
+                                messages.clear();
+                                break;
+                            }
+                        }
+                    }
+                    messages.sort_by_key(|message| (message.date, message.id));
+                    messages.truncate(CHAT_HISTORY_LIMIT);
+                    let _ = events.send(BackendEvent::ChatHistoryLoaded { chat_id, messages }).await;
                 }
                 None => break,
             },
@@ -430,7 +520,6 @@ async fn run_supervisor(
 }
 
 async fn load_main_chats(client_id: i32, events: &mpsc::Sender<BackendEvent>) -> bool {
-
     let load_result = tdlib_rs::functions::load_chats(
         Some(tdlib_rs::enums::ChatList::Main),
         CHAT_LIST_LIMIT,

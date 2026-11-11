@@ -72,7 +72,7 @@ measurements.
 
 ## 3. Reading
 
-- **3.1 Open chat and history.** ☐ Tell the backend which chat is open; load
+- **3.1 Open chat and history.** ✅ Tell the backend which chat is open; load
   the last 50 messages; retry when the first response is short or empty;
   chronological order; unsupported content shown as a placeholder.
 - **3.2 Load older messages.** ☐ "Load more" button (no infinite scroll yet).
