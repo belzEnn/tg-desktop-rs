@@ -105,13 +105,19 @@ impl Adapter {
 
                 let client_id = tdlib_rs::create_client();
                 let (update_sender, update_receiver) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
+                let (overflow_sender, overflow_receiver) = mpsc::channel(1);
                 let receiver_running = Arc::new(AtomicBool::new(true));
                 let receiver_running_task = Arc::clone(&receiver_running);
                 let receive_thread =
                     thread::Builder::new()
                         .name("tdlib-receive".into())
                         .spawn(move || {
-                            receive_updates(client_id, update_sender, receiver_running_task)
+                            receive_updates(
+                                client_id,
+                                update_sender,
+                                overflow_sender,
+                                receiver_running_task,
+                            )
                         });
 
                 let receive_thread = match receive_thread {
@@ -130,6 +136,7 @@ impl Adapter {
                     data_dir,
                     command_receiver,
                     update_receiver,
+                    overflow_receiver,
                     event_sender,
                 ));
                 receiver_running.store(false, Ordering::Release);
@@ -225,13 +232,20 @@ fn subscription_stream(
 fn receive_updates(
     client_id: i32,
     sender: mpsc::Sender<(tdlib_rs::enums::Update, i32)>,
+    overflow_sender: mpsc::Sender<()>,
     running: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::Acquire) {
-        if let Some(update) = tdlib_rs::receive()
-            && sender.blocking_send(update).is_err()
-        {
-            break;
+        if let Some(update) = tdlib_rs::receive() {
+            match sender.try_send(update) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Never block TDLib's only receive thread: responses to
+                    // pending API requests are delivered through the same call.
+                    let _ = overflow_sender.try_send(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
         }
     }
     tracing::debug!(client_id, "TDLib update receiver stopped");
@@ -244,10 +258,12 @@ async fn run_supervisor(
     data_dir: PathBuf,
     mut commands: mpsc::Receiver<BackendCommand>,
     mut updates: mpsc::Receiver<(tdlib_rs::enums::Update, i32)>,
+    mut update_overflows: mpsc::Receiver<()>,
     events: mpsc::Sender<BackendEvent>,
 ) {
     let mut client_id = initial_client_id;
     let mut client_closed = false;
+    let mut main_chats_loaded = false;
     loop {
         tokio::select! {
             command = commands.recv() => match command {
@@ -258,6 +274,20 @@ async fn run_supervisor(
                     }
                     if tdlib_rs::functions::set_log_verbosity_level(2, client_id).await.is_err() {
                         warn!("could not lower TDLib log verbosity");
+                    }
+                    match tdlib_rs::functions::get_authorization_state(client_id).await {
+                        Ok(state) => {
+                            let state = mapping::authorization_state_from_tdlib(&state);
+                            if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
+                                break;
+                            }
+                            if state == AuthorizationState::Ready && !main_chats_loaded {
+                                main_chats_loaded = load_main_chats(client_id, &events).await;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(code = error.code, "could not read TDLib authorization state");
+                        }
                     }
                 }
                 Some(BackendCommand::LogOut) => {
@@ -299,16 +329,13 @@ async fn run_supervisor(
                     if let Some(state) = mapping::authorization_state(&update) {
                         if state == AuthorizationState::Closed {
                             client_closed = true;
+                            main_chats_loaded = false;
                         }
                         if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                             break;
                         }
-                        if state == AuthorizationState::Ready
-                            && let Err(error) = tdlib_rs::functions::load_chats(
-                                Some(tdlib_rs::enums::ChatList::Main), CHAT_LIST_LIMIT, client_id,
-                            ).await
-                        {
-                            warn!(code = error.code, "could not load Telegram chat list");
+                        if state == AuthorizationState::Ready && !main_chats_loaded {
+                            main_chats_loaded = load_main_chats(client_id, &events).await;
                         }
                         if state == AuthorizationState::WaitTdlibParameters
                             && let Some(error) = configure_tdlib(
@@ -327,27 +354,135 @@ async fn run_supervisor(
                             break;
                         }
                     } else if let tdlib_rs::enums::Update::NewChat(new_chat) = &update {
-                        if let Some(chat) = mapping::chat(&new_chat.chat)
-                            && events.send(BackendEvent::ChatUpdated(chat)).await.is_err()
-                        {
-                            break;
+                        match mapping::chat(&new_chat.chat) {
+                            Some(chat) => {
+                                if events.send(BackendEvent::ChatUpdated(chat)).await.is_err() {
+                                    break;
+                                }
+                                tracing::debug!("published chat summary from new-chat update");
+                            }
+                            None => tracing::debug!(
+                                "new-chat update has no main-list position yet"
+                            ),
                         }
-                    } else if let Some(chat_id) = mapping::chat_update_id(&update)
-                        && let Ok(td_chat) = tdlib_rs::functions::get_chat(chat_id, client_id).await
-                    {
-                        let tdlib_rs::enums::Chat::Chat(td_chat) = td_chat;
-                        if let Some(chat) = mapping::chat(&td_chat)
-                            && events.send(BackendEvent::ChatUpdated(chat)).await.is_err()
-                        {
-                            break;
+                    } else if let Some(chat_id) = mapping::chat_update_id(&update) {
+                        match tdlib_rs::functions::get_chat(chat_id, client_id).await {
+                            Ok(tdlib_rs::enums::Chat::Chat(td_chat)) => {
+                                match mapping::chat(&td_chat) {
+                                    Some(chat) => {
+                                        if events.send(BackendEvent::ChatUpdated(chat)).await.is_err() {
+                                            break;
+                                        }
+                                        tracing::debug!("published chat summary from chat update");
+                                    }
+                                    None => tracing::debug!(
+                                        "chat update has no main-list position; skipped summary"
+                                    ),
+                                }
+                            }
+                            Err(error) => warn!(
+                                code = error.code,
+                                "could not read chat after Telegram update"
+                            ),
                         }
                     }
                 }
                 Some(_) => {}
                 None => break,
-            }
+            },
+            overflow = update_overflows.recv() => match overflow {
+                Some(()) => {
+                    warn!("TDLib update queue overflowed; resynchronizing authorization and chats");
+                    match tdlib_rs::functions::get_authorization_state(client_id).await {
+                        Ok(td_state) => {
+                            let state = mapping::authorization_state_from_tdlib(&td_state);
+                            if state == AuthorizationState::Closed {
+                                client_closed = true;
+                                main_chats_loaded = false;
+                            }
+                            if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
+                                break;
+                            }
+                            if state == AuthorizationState::Ready {
+                                main_chats_loaded = load_main_chats(client_id, &events).await;
+                            } else if state == AuthorizationState::WaitTdlibParameters
+                                && let Some(error) = configure_tdlib(
+                                    client_id,
+                                    use_test_dc,
+                                    credentials.as_ref(),
+                                    &data_dir,
+                                ).await
+                            {
+                                let _ = events
+                                    .send(BackendEvent::AuthorizationError(error.into()))
+                                    .await;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(code = error.code, "could not resynchronize TDLib authorization state");
+                        }
+                    }
+                }
+                None => break,
+            },
         }
     }
+}
+
+async fn load_main_chats(client_id: i32, events: &mpsc::Sender<BackendEvent>) -> bool {
+
+    let load_result = tdlib_rs::functions::load_chats(
+        Some(tdlib_rs::enums::ChatList::Main),
+        CHAT_LIST_LIMIT,
+        client_id,
+    )
+    .await;
+    let load_was_expected = match load_result {
+        Ok(()) => true,
+        Err(error) if error.code == 404 => true,
+        Err(error) => {
+            warn!(code = error.code, "could not load Telegram chat list");
+            false
+        }
+    };
+
+    let chat_ids = match tdlib_rs::functions::get_chats(
+        Some(tdlib_rs::enums::ChatList::Main),
+        CHAT_LIST_LIMIT,
+        client_id,
+    )
+    .await
+    {
+        Ok(tdlib_rs::enums::Chats::Chats(chats)) => chats.chat_ids,
+        Err(error) => {
+            warn!(
+                code = error.code,
+                "could not read cached Telegram chat list"
+            );
+            return load_was_expected;
+        }
+    };
+    tracing::info!(count = chat_ids.len(), "loaded Telegram chat list snapshot");
+
+    let mut published_count = 0;
+    for chat_id in chat_ids {
+        match tdlib_rs::functions::get_chat(chat_id, client_id).await {
+            Ok(tdlib_rs::enums::Chat::Chat(chat)) => {
+                if let Some(chat) = mapping::chat(&chat) {
+                    if events.send(BackendEvent::ChatUpdated(chat)).await.is_err() {
+                        return false;
+                    }
+                    published_count += 1;
+                }
+            }
+            Err(error) => warn!(code = error.code, "could not read cached Telegram chat"),
+        }
+    }
+    tracing::info!(
+        count = published_count,
+        "published Telegram chats to application"
+    );
+    load_was_expected
 }
 
 async fn configure_tdlib(

@@ -74,7 +74,11 @@ pub(super) fn authorization_state(update: &Update) -> Option<AuthorizationState>
         return None;
     };
 
-    Some(match &update.authorization_state {
+    Some(authorization_state_from_tdlib(&update.authorization_state))
+}
+
+pub(super) fn authorization_state_from_tdlib(state: &TdAuthorizationState) -> AuthorizationState {
+    match state {
         TdAuthorizationState::WaitTdlibParameters => AuthorizationState::WaitTdlibParameters,
         TdAuthorizationState::WaitPhoneNumber => AuthorizationState::WaitPhoneNumber,
         TdAuthorizationState::WaitCode(_) => AuthorizationState::WaitCode,
@@ -83,7 +87,7 @@ pub(super) fn authorization_state(update: &Update) -> Option<AuthorizationState>
         TdAuthorizationState::Ready => AuthorizationState::Ready,
         TdAuthorizationState::Closed => AuthorizationState::Closed,
         _ => AuthorizationState::Other,
-    })
+    }
 }
 
 /// Converts TDLib's error text to a fixed, non-sensitive message for the login UI.
