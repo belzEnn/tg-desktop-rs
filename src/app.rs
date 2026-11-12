@@ -2,11 +2,18 @@
 
 use iced::widget::text_editor;
 use iced::{Subscription, Task};
+use std::collections::HashSet;
 
 use crate::{
     domain::{AuthorizationState, BackendEvent, ChatMessage, ChatSummary},
     tg::{Adapter, AdapterCommandError},
 };
+
+const HISTORY_PAGE_SIZE: usize = 50;
+const HISTORY_PREFETCH_AFTER_MESSAGES: usize = 30;
+const HISTORY_PREFETCH_FRACTION: f32 =
+    (HISTORY_PAGE_SIZE - HISTORY_PREFETCH_AFTER_MESSAGES) as f32 / HISTORY_PAGE_SIZE as f32;
+pub(crate) const CHAT_HISTORY_SCROLL_ID: &str = "chat-history";
 
 /// State owned by the application's update loop.
 pub(crate) struct State {
@@ -22,6 +29,11 @@ pub(crate) struct State {
     messages: Vec<ChatMessage>,
     history_loading: bool,
     history_error: Option<String>,
+    has_older_messages: bool,
+    loading_older_messages: bool,
+    history_load_trigger_armed: bool,
+    history_content_height: f32,
+    pending_scroll_adjustment: Option<f32>,
     composer: text_editor::Content,
     next_temporary_message_id: i64,
     send_error: Option<String>,
@@ -43,6 +55,14 @@ pub(crate) enum Message {
     LogoutCommandSent(Result<(), AdapterCommandError>),
     OpenChat(i64),
     ChatOpenCommandSent(Result<(), AdapterCommandError>),
+    HistoryScrolled {
+        offset_y: f32,
+        content_height: f32,
+    },
+    OlderMessagesCommandSent {
+        chat_id: i64,
+        result: Result<(), AdapterCommandError>,
+    },
     ComposerAction(text_editor::Action),
     Submit,
     SendMessageCommandSent {
@@ -68,6 +88,11 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
         messages: Vec::new(),
         history_loading: false,
         history_error: None,
+        has_older_messages: false,
+        loading_older_messages: false,
+        history_load_trigger_armed: false,
+        history_content_height: 0.0,
+        pending_scroll_adjustment: None,
         composer: text_editor::Content::new(),
         next_temporary_message_id: -1,
         send_error: None,
@@ -95,6 +120,11 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.chats.clear();
                 state.open_chat_id = None;
                 state.messages.clear();
+                state.has_older_messages = false;
+                state.loading_older_messages = false;
+                state.history_load_trigger_armed = false;
+                state.history_content_height = 0.0;
+                state.pending_scroll_adjustment = None;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 let backend = state.backend.clone();
@@ -145,11 +175,44 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::BackendEvent(BackendEvent::ChatRemoved(chat_id)) => {
             state.chats.retain(|chat| chat.id != chat_id);
         }
-        Message::BackendEvent(BackendEvent::ChatHistoryLoaded { chat_id, messages }) => {
+        Message::BackendEvent(BackendEvent::ChatHistoryLoaded {
+            chat_id,
+            messages,
+            has_older_messages,
+        }) => {
             if state.open_chat_id == Some(chat_id) {
                 state.messages = messages;
                 state.history_loading = false;
                 state.history_error = None;
+                state.has_older_messages = has_older_messages;
+                state.loading_older_messages = false;
+                state.history_load_trigger_armed = false;
+                state.pending_scroll_adjustment = None;
+                return iced::widget::operation::snap_to_end(CHAT_HISTORY_SCROLL_ID);
+            }
+        }
+        Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+            chat_id,
+            messages,
+            has_older_messages,
+        }) => {
+            if state.open_chat_id == Some(chat_id) {
+                state.loading_older_messages = false;
+                state.has_older_messages = has_older_messages;
+                state.history_error = None;
+                if !messages.is_empty() {
+                    state.pending_scroll_adjustment = Some(state.history_content_height);
+                    prepend_messages(&mut state.messages, messages);
+                } else {
+                    state.pending_scroll_adjustment = None;
+                }
+            }
+        }
+        Message::BackendEvent(BackendEvent::OlderChatHistoryError { chat_id, message }) => {
+            if state.open_chat_id == Some(chat_id) {
+                state.loading_older_messages = false;
+                state.pending_scroll_adjustment = None;
+                state.history_error = Some(message);
             }
         }
         Message::BackendEvent(BackendEvent::ChatHistoryError { chat_id, message }) => {
@@ -254,6 +317,11 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.open_chat_id != Some(chat_id) {
                 state.open_chat_id = Some(chat_id);
                 state.messages.clear();
+                state.has_older_messages = false;
+                state.loading_older_messages = false;
+                state.history_load_trigger_armed = false;
+                state.history_content_height = 0.0;
+                state.pending_scroll_adjustment = None;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 state.history_loading = true;
@@ -270,6 +338,60 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.history_error = Some(error.to_string());
         }
         Message::ChatOpenCommandSent(Ok(())) => {}
+        Message::HistoryScrolled {
+            offset_y,
+            content_height,
+        } => {
+            state.history_content_height = content_height;
+            if let Some(previous_content_height) = state.pending_scroll_adjustment.take() {
+                let added_height = (content_height - previous_content_height).max(0.0);
+                if added_height > 0.0 {
+                    return iced::widget::operation::scroll_by(
+                        CHAT_HISTORY_SCROLL_ID,
+                        iced::widget::operation::AbsoluteOffset {
+                            x: 0.0,
+                            y: added_height,
+                        },
+                    );
+                }
+            }
+
+            let near_prefetch_point =
+                content_height > 0.0 && offset_y / content_height <= HISTORY_PREFETCH_FRACTION;
+            if !near_prefetch_point {
+                state.history_load_trigger_armed = true;
+            } else if state.history_load_trigger_armed
+                && state.has_older_messages
+                && !state.loading_older_messages
+            {
+                let Some(oldest_message_id) = state.messages.first().map(|message| message.id)
+                else {
+                    return Task::none();
+                };
+                let Some(chat_id) = state.open_chat_id else {
+                    return Task::none();
+                };
+                state.history_load_trigger_armed = false;
+                state.loading_older_messages = true;
+                let backend = state.backend.clone();
+                return Task::perform(
+                    async move {
+                        backend
+                            .load_older_messages(chat_id, oldest_message_id)
+                            .await
+                    },
+                    move |result| Message::OlderMessagesCommandSent { chat_id, result },
+                );
+            }
+        }
+        Message::OlderMessagesCommandSent { chat_id, result } => {
+            if let Err(error) = result
+                && state.open_chat_id == Some(chat_id)
+            {
+                state.loading_older_messages = false;
+                state.history_error = Some(error.to_string());
+            }
+        }
         Message::ComposerAction(action) => {
             state.composer.perform(action);
             state.send_error = None;
@@ -344,10 +466,19 @@ fn insert_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
         messages.push(message);
     }
     messages.sort_by_key(|message| (message.date, message.id));
-    if messages.len() > 50 {
-        let excess = messages.len() - 50;
-        messages.drain(0..excess);
-    }
+}
+
+fn prepend_messages(existing: &mut Vec<ChatMessage>, older: Vec<ChatMessage>) {
+    let mut known_ids: HashSet<_> = existing.iter().map(|message| message.id).collect();
+    let mut combined = Vec::with_capacity(existing.len() + older.len());
+    combined.extend(
+        older
+            .into_iter()
+            .filter(|message| known_ids.insert(message.id)),
+    );
+    combined.append(existing);
+    combined.sort_by_key(|message| (message.date, message.id));
+    *existing = combined;
 }
 
 fn current_unix_timestamp() -> i32 {

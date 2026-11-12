@@ -170,7 +170,14 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                         text_editor::Binding::from_key_press(press)
                     }
                 });
-            let mut conversation = column![scrollable(history).height(iced::Length::Fill)];
+            let history = scrollable(history)
+                .id(app::CHAT_HISTORY_SCROLL_ID)
+                .on_scroll(|viewport| app::Message::HistoryScrolled {
+                    offset_y: viewport.absolute_offset().y,
+                    content_height: viewport.content_bounds().height,
+                })
+                .height(iced::Length::Fill);
+            let mut conversation = column![history];
             if open_chat.is_some() {
                 if let Some(error) = state.send_error() {
                     conversation = conversation.push(text(error));

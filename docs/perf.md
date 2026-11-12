@@ -100,3 +100,12 @@ pages until up to 50 messages are available. Application state retains only
 the selected chat's messages; switching chats clears the previous history.
 RSS measurements after login, opening a 50-message chat, and one idle hour
 remain pending until measured with a Telegram test account.
+
+## Load older messages (Phase 3.2)
+
+The open chat begins with at most 50 messages and requests another page of 50
+when scrolling reaches approximately the 30th message from newest. Text history
+is retained only for the selected chat and cleared when another chat is opened;
+there is no separate history cache. Memory use can therefore grow with the
+number of pages visited in the active chat. RSS measurements after login,
+opening a chat, and one idle hour remain pending with a Telegram test account.

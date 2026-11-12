@@ -75,7 +75,8 @@ measurements.
 - **3.1 Open chat and history.** ✅ Tell the backend which chat is open; load
   the last 50 messages; retry when the first response is short or empty;
   chronological order; unsupported content shown as a placeholder.
-- **3.2 Load older messages.** ☐ "Load more" button (no infinite scroll yet).
+- **3.2 Load older messages.** ✅ Load 50 messages initially; automatically load
+  50 older messages when scrolling reaches about the 30th message from newest.
 - **3.3 Live incoming messages.** ✅ New messages appear in the open chat
   without reload.
 

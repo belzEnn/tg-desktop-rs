@@ -59,6 +59,10 @@ enum BackendCommand {
     SubmitCode(String),
     SubmitPassword(String),
     OpenChat(i64),
+    LoadOlderMessages {
+        chat_id: i64,
+        before_message_id: i64,
+    },
     SendText {
         chat_id: i64,
         message_id: i64,
@@ -207,6 +211,21 @@ impl Adapter {
     pub(crate) async fn open_chat(&self, chat_id: i64) -> Result<(), AdapterCommandError> {
         self.commands
             .send(BackendCommand::OpenChat(chat_id))
+            .await
+            .map_err(|_| AdapterCommandError::WorkerStopped)
+    }
+
+    /// Loads the messages before the oldest message currently shown in a chat.
+    pub(crate) async fn load_older_messages(
+        &self,
+        chat_id: i64,
+        before_message_id: i64,
+    ) -> Result<(), AdapterCommandError> {
+        self.commands
+            .send(BackendCommand::LoadOlderMessages {
+                chat_id,
+                before_message_id,
+            })
             .await
             .map_err(|_| AdapterCommandError::WorkerStopped)
     }
@@ -366,8 +385,6 @@ async fn run_supervisor(
                         continue;
                     }
                     let mut messages: Vec<ChatMessage> = Vec::with_capacity(CHAT_HISTORY_LIMIT);
-                    let mut sender_names: HashMap<mapping::MessageSenderReference, String> =
-                        HashMap::new();
                     let mut from_message_id = 0;
                     let mut first_request = true;
                     loop {
@@ -389,33 +406,7 @@ async fn run_supervisor(
                                 if from_message_id != 0 && oldest_id >= from_message_id {
                                     break;
                                 }
-                                for message in page_messages {
-                                    if !messages.iter().any(|loaded| loaded.id == message.id) {
-                                        let sender = mapping::message_sender(&message);
-                                        let sender_name = if let Some(name) = sender_names.get(&sender) {
-                                            name.clone()
-                                        } else {
-                                            let name = match sender {
-                                                mapping::MessageSenderReference::Outgoing => "You".into(),
-                                                mapping::MessageSenderReference::User(user_id) => {
-                                                    match tdlib_rs::functions::get_user(user_id, client_id).await {
-                                                        Ok(tdlib_rs::enums::User::User(user)) => mapping::user_name(&user),
-                                                        Err(_) => "Unknown sender".into(),
-                                                    }
-                                                }
-                                                mapping::MessageSenderReference::Chat(sender_chat_id) => {
-                                                    match tdlib_rs::functions::get_chat(sender_chat_id, client_id).await {
-                                                        Ok(tdlib_rs::enums::Chat::Chat(chat)) => mapping::chat_title(&chat),
-                                                        Err(_) => "Unknown sender".into(),
-                                                    }
-                                                }
-                                            };
-                                            sender_names.insert(sender, name.clone());
-                                            name
-                                        };
-                                        messages.push(mapping::chat_message(message, sender_name));
-                                    }
-                                }
+                                messages.extend(map_history_messages(page_messages, client_id).await);
                                 if messages.len() >= CHAT_HISTORY_LIMIT || received >= CHAT_HISTORY_LIMIT || oldest_id == 0 {
                                     break;
                                 }
@@ -433,7 +424,44 @@ async fn run_supervisor(
                     }
                     messages.sort_by_key(|message| (message.date, message.id));
                     messages.truncate(CHAT_HISTORY_LIMIT);
-                    let _ = events.send(BackendEvent::ChatHistoryLoaded { chat_id, messages }).await;
+                    let has_older_messages = messages.len() >= CHAT_HISTORY_LIMIT;
+                    let _ = events.send(BackendEvent::ChatHistoryLoaded {
+                        chat_id,
+                        messages,
+                        has_older_messages,
+                    }).await;
+                }
+                Some(BackendCommand::LoadOlderMessages { chat_id, before_message_id }) => {
+                    match tdlib_rs::functions::get_chat_history(
+                        chat_id,
+                        before_message_id,
+                        0,
+                        CHAT_HISTORY_LIMIT as i32,
+                        false,
+                        client_id,
+                    ).await {
+                        Ok(tdlib_rs::enums::Messages::Messages(page)) => {
+                            let raw_messages: Vec<_> = page.messages.into_iter().flatten().collect();
+                            let has_older_messages = raw_messages.len() >= CHAT_HISTORY_LIMIT;
+                            let messages = map_history_messages(raw_messages, client_id).await;
+                            let mut messages: Vec<_> = messages.into_iter()
+                                .filter(|message| message.id < before_message_id)
+                                .collect();
+                            messages.sort_by_key(|message| (message.date, message.id));
+                            let has_older_messages = has_older_messages && !messages.is_empty();
+                            let _ = events.send(BackendEvent::OlderChatHistoryLoaded {
+                                chat_id,
+                                messages,
+                                has_older_messages,
+                            }).await;
+                        }
+                        Err(error) => {
+                            let _ = events.send(BackendEvent::OlderChatHistoryError {
+                                chat_id,
+                                message: format!("Could not load older messages (error {}).", error.code),
+                            }).await;
+                        }
+                    }
                 }
                 Some(BackendCommand::SendText { chat_id, message_id, text }) => {
                     let content = mapping::input_text_content(text.clone());
@@ -618,6 +646,26 @@ async fn resolve_sender_name(sender: mapping::MessageSenderReference, client_id:
             }
         }
     }
+}
+
+async fn map_history_messages(
+    messages: Vec<tdlib_rs::types::Message>,
+    client_id: i32,
+) -> Vec<ChatMessage> {
+    let mut sender_names: HashMap<mapping::MessageSenderReference, String> = HashMap::new();
+    let mut mapped_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        let sender = mapping::message_sender(&message);
+        let sender_name = if let Some(name) = sender_names.get(&sender) {
+            name.clone()
+        } else {
+            let name = resolve_sender_name(sender, client_id).await;
+            sender_names.insert(sender, name.clone());
+            name
+        };
+        mapped_messages.push(mapping::chat_message(message, sender_name));
+    }
+    mapped_messages
 }
 
 async fn load_main_chats(client_id: i32, events: &mpsc::Sender<BackendEvent>) -> bool {
