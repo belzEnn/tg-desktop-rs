@@ -57,14 +57,73 @@ pub(super) fn new_message_sender(update: &Update) -> Option<MessageSenderReferen
     Some(message_sender(&update.message))
 }
 
-pub(super) fn new_message(update: &Update, sender_name: String) -> Option<(i64, ChatMessage)> {
+pub(super) fn new_message_id(update: &Update) -> Option<i64> {
     let Update::NewMessage(update) = update else {
         return None;
     };
-    Some((
-        update.message.chat_id,
-        chat_message(update.message.clone(), sender_name),
-    ))
+    Some(update.message.id)
+}
+
+pub(super) fn new_message(
+    update: &Update,
+    sender_name: String,
+    message_id: Option<i64>,
+) -> Option<(i64, ChatMessage)> {
+    let Update::NewMessage(update) = update else {
+        return None;
+    };
+    let mut message = chat_message(update.message.clone(), sender_name);
+    if let Some(message_id) = message_id {
+        message.id = message_id;
+    }
+    Some((update.message.chat_id, message))
+}
+
+pub(super) fn input_text_content(text: String) -> tdlib_rs::enums::InputMessageContent {
+    tdlib_rs::enums::InputMessageContent::InputMessageText(tdlib_rs::types::InputMessageText {
+        text: tdlib_rs::types::FormattedText {
+            text,
+            entities: Vec::new(),
+        },
+        link_preview_options: None,
+        clear_draft: true,
+    })
+}
+
+pub(super) fn successful_message_sender(update: &Update) -> Option<MessageSenderReference> {
+    let Update::MessageSendSucceeded(update) = update else {
+        return None;
+    };
+    Some(message_sender(&update.message))
+}
+
+pub(super) fn successful_message_id(update: &Update) -> Option<i64> {
+    let Update::MessageSendSucceeded(update) = update else {
+        return None;
+    };
+    Some(update.old_message_id)
+}
+
+pub(super) fn message_send_succeeded(
+    update: &Update,
+    sender_name: String,
+    client_message_id: Option<i64>,
+) -> Option<(i64, i64, ChatMessage)> {
+    let Update::MessageSendSucceeded(update) = update else {
+        return None;
+    };
+    let mut message = chat_message(update.message.clone(), sender_name);
+    if let Some(message_id) = client_message_id {
+        message.id = message_id;
+    }
+    Some((update.message.chat_id, update.old_message_id, message))
+}
+
+pub(super) fn message_send_failed(update: &Update) -> Option<(i64, i64)> {
+    let Update::MessageSendFailed(update) = update else {
+        return None;
+    };
+    Some((update.message.chat_id, update.old_message_id))
 }
 
 pub(super) fn chat_message(message: tdlib_rs::types::Message, sender_name: String) -> ChatMessage {

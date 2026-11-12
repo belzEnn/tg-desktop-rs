@@ -81,7 +81,7 @@ measurements.
 
 ## 4. Sending
 
-- **4.1 Composer and text send.** ☐ Enter sends, Shift+Enter inserts a newline;
+- **4.1 Composer and text send.** ✅ Enter sends, Shift+Enter inserts a newline;
   temporary message id reconciled on the success update.
 - **4.2 Send status and errors.** ☐ `Sending` / `Sent` / `Failed(reason)`
   shown per message; a failed send never breaks the chat.

@@ -1,5 +1,6 @@
 // Application state and update logic.
 
+use iced::widget::text_editor;
 use iced::{Subscription, Task};
 
 use crate::{
@@ -21,6 +22,9 @@ pub(crate) struct State {
     messages: Vec<ChatMessage>,
     history_loading: bool,
     history_error: Option<String>,
+    composer: text_editor::Content,
+    next_temporary_message_id: i64,
+    send_error: Option<String>,
 }
 
 /// Messages handled by the application update loop.
@@ -39,6 +43,14 @@ pub(crate) enum Message {
     LogoutCommandSent(Result<(), AdapterCommandError>),
     OpenChat(i64),
     ChatOpenCommandSent(Result<(), AdapterCommandError>),
+    ComposerAction(text_editor::Action),
+    Submit,
+    SendMessageCommandSent {
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+        result: Result<(), AdapterCommandError>,
+    },
 }
 
 /// Creates application state and starts the backend through an iced task.
@@ -56,6 +68,9 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
         messages: Vec::new(),
         history_loading: false,
         history_error: None,
+        composer: text_editor::Content::new(),
+        next_temporary_message_id: -1,
+        send_error: None,
     };
     let task = Task::perform(
         async move { backend.initialize().await },
@@ -80,6 +95,8 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.chats.clear();
                 state.open_chat_id = None;
                 state.messages.clear();
+                state.composer = text_editor::Content::new();
+                state.send_error = None;
                 let backend = state.backend.clone();
                 return Task::perform(
                     async move { backend.initialize().await },
@@ -142,20 +159,34 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::BackendEvent(BackendEvent::NewMessage { chat_id, message }) => {
-            if state.open_chat_id == Some(chat_id)
-                && !state
-                    .messages
-                    .iter()
-                    .any(|existing| existing.id == message.id)
-            {
-                state.messages.push(message);
+            if state.open_chat_id == Some(chat_id) {
+                insert_message(&mut state.messages, message);
+            }
+        }
+        Message::BackendEvent(BackendEvent::MessageSendSucceeded {
+            chat_id,
+            old_message_id,
+            message,
+        }) => {
+            if state.open_chat_id == Some(chat_id) {
                 state
                     .messages
-                    .sort_by_key(|message| (message.date, message.id));
-                if state.messages.len() > 50 {
-                    let excess = state.messages.len() - 50;
-                    state.messages.drain(0..excess);
+                    .retain(|existing| existing.id != old_message_id);
+                insert_message(&mut state.messages, message);
+            }
+        }
+        Message::BackendEvent(BackendEvent::MessageSendRejected {
+            chat_id,
+            message_id,
+            text,
+            reason,
+        }) => {
+            if state.open_chat_id == Some(chat_id) {
+                state.messages.retain(|existing| existing.id != message_id);
+                if state.composer.text().is_empty() {
+                    state.composer = text_editor::Content::with_text(&text);
                 }
+                state.send_error = Some(reason);
             }
         }
         Message::Initialized(Ok(())) => {}
@@ -223,6 +254,8 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.open_chat_id != Some(chat_id) {
                 state.open_chat_id = Some(chat_id);
                 state.messages.clear();
+                state.composer = text_editor::Content::new();
+                state.send_error = None;
                 state.history_loading = true;
                 state.history_error = None;
                 let backend = state.backend.clone();
@@ -237,12 +270,90 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.history_error = Some(error.to_string());
         }
         Message::ChatOpenCommandSent(Ok(())) => {}
+        Message::ComposerAction(action) => {
+            state.composer.perform(action);
+            state.send_error = None;
+        }
+        Message::Submit => {
+            let Some(chat_id) = state.open_chat_id else {
+                return Task::none();
+            };
+            let text = state.composer.text();
+            if text.trim().is_empty() {
+                return Task::none();
+            }
+            let message_id = state.next_temporary_message_id;
+            state.next_temporary_message_id = state.next_temporary_message_id.saturating_sub(1);
+            insert_message(
+                &mut state.messages,
+                ChatMessage {
+                    id: message_id,
+                    date: current_unix_timestamp(),
+                    sender_name: "You".into(),
+                    text: text.clone(),
+                    is_outgoing: true,
+                },
+            );
+            state.composer = text_editor::Content::new();
+            state.send_error = None;
+            let backend = state.backend.clone();
+            return Task::perform(
+                async move {
+                    let result = backend.send_text(chat_id, message_id, text.clone()).await;
+                    (chat_id, message_id, text, result)
+                },
+                |(chat_id, message_id, text, result)| Message::SendMessageCommandSent {
+                    chat_id,
+                    message_id,
+                    text,
+                    result,
+                },
+            );
+        }
+        Message::SendMessageCommandSent {
+            chat_id,
+            message_id,
+            text,
+            result,
+        } => {
+            if let Err(error) = result
+                && state.open_chat_id == Some(chat_id)
+            {
+                state.messages.retain(|message| message.id != message_id);
+                if state.composer.text().is_empty() {
+                    state.composer = text_editor::Content::with_text(&text);
+                }
+                state.send_error = Some(error.to_string());
+            }
+        }
         Message::AuthorizationCommandSent(Err(error)) => {
             state.authorization_error = Some(error.to_string());
         }
         Message::AuthorizationCommandSent(Ok(())) => {}
     }
     Task::none()
+}
+
+fn insert_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|existing| existing.id == message.id)
+    {
+        *existing = message;
+    } else {
+        messages.push(message);
+    }
+    messages.sort_by_key(|message| (message.date, message.id));
+    if messages.len() > 50 {
+        let excess = messages.len() - 50;
+        messages.drain(0..excess);
+    }
+}
+
+fn current_unix_timestamp() -> i32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i32)
 }
 
 impl State {
@@ -278,5 +389,11 @@ impl State {
     }
     pub(crate) fn history_error(&self) -> Option<&str> {
         self.history_error.as_deref()
+    }
+    pub(crate) fn composer(&self) -> &text_editor::Content {
+        &self.composer
+    }
+    pub(crate) fn send_error(&self) -> Option<&str> {
+        self.send_error.as_deref()
     }
 }

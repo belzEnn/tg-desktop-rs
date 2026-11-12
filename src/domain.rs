@@ -49,6 +49,19 @@ pub enum BackendEvent {
         chat_id: i64,
         message: ChatMessage,
     },
+    /// A temporary outgoing message was replaced by Telegram's sent message.
+    MessageSendSucceeded {
+        chat_id: i64,
+        old_message_id: i64,
+        message: ChatMessage,
+    },
+    /// Telegram rejected an outgoing message before accepting it for delivery.
+    MessageSendRejected {
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+        reason: String,
+    },
     /// A chat history request failed with a safe-to-display message.
     ChatHistoryError {
         chat_id: i64,

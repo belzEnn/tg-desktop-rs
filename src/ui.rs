@@ -2,7 +2,8 @@
 
 use iced::{
     Element,
-    widget::{button, column, container, row, scrollable, text, text_input},
+    keyboard::{Key, key::Named},
+    widget::{button, column, container, row, scrollable, text, text_editor, text_input},
 };
 
 use crate::{app, domain::AuthorizationState, tg::Adapter};
@@ -153,6 +154,33 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
             } else {
                 history = history.push(text("Select a chat to view its messages."));
             }
+            let composer = text_editor(state.composer())
+                .placeholder("Write a message")
+                .min_height(42)
+                .max_height(120)
+                .on_action(app::Message::ComposerAction)
+                .key_binding(|press| {
+                    if press.modified_key == Key::Named(Named::Enter) {
+                        if press.modifiers.shift() {
+                            Some(text_editor::Binding::Enter)
+                        } else {
+                            Some(text_editor::Binding::Custom(app::Message::Submit))
+                        }
+                    } else {
+                        text_editor::Binding::from_key_press(press)
+                    }
+                });
+            let mut conversation = column![scrollable(history).height(iced::Length::Fill)];
+            if open_chat.is_some() {
+                if let Some(error) = state.send_error() {
+                    conversation = conversation.push(text(error));
+                }
+                conversation = conversation.push(
+                    row![composer, button("Send").on_press(app::Message::Submit),]
+                        .spacing(8)
+                        .align_y(iced::Alignment::End),
+                );
+            }
             let chat_area = column![
                 row![
                     text("").width(iced::Length::Fill),
@@ -164,7 +192,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     .on_press(app::Message::LogOut),
                 ]
                 .align_y(iced::Alignment::Center),
-                scrollable(history).height(iced::Length::Fill),
+                conversation,
             ]
             .padding(12)
             .width(iced::Length::Fill)
