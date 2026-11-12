@@ -44,6 +44,11 @@ pub enum BackendEvent {
         chat_id: i64,
         messages: Vec<ChatMessage>,
     },
+    /// A newly received or sent message in a chat.
+    NewMessage {
+        chat_id: i64,
+        message: ChatMessage,
+    },
     /// A chat history request failed with a safe-to-display message.
     ChatHistoryError {
         chat_id: i64,

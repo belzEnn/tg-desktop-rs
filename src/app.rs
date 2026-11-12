@@ -141,6 +141,23 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.history_error = Some(message);
             }
         }
+        Message::BackendEvent(BackendEvent::NewMessage { chat_id, message }) => {
+            if state.open_chat_id == Some(chat_id)
+                && !state
+                    .messages
+                    .iter()
+                    .any(|existing| existing.id == message.id)
+            {
+                state.messages.push(message);
+                state
+                    .messages
+                    .sort_by_key(|message| (message.date, message.id));
+                if state.messages.len() > 50 {
+                    let excess = state.messages.len() - 50;
+                    state.messages.drain(0..excess);
+                }
+            }
+        }
         Message::Initialized(Ok(())) => {}
         Message::Initialized(Err(error)) => {
             tracing::error!(%error, "Telegram backend initialization command failed");

@@ -476,6 +476,27 @@ async fn run_supervisor(
                             ),
                         }
                     }
+                    if let Some(sender) = mapping::new_message_sender(&update) {
+                        let sender_name = match sender {
+                            mapping::MessageSenderReference::Outgoing => "You".into(),
+                            mapping::MessageSenderReference::User(user_id) => {
+                                match tdlib_rs::functions::get_user(user_id, client_id).await {
+                                    Ok(tdlib_rs::enums::User::User(user)) => mapping::user_name(&user),
+                                    Err(_) => "Unknown sender".into(),
+                                }
+                            }
+                            mapping::MessageSenderReference::Chat(sender_chat_id) => {
+                                match tdlib_rs::functions::get_chat(sender_chat_id, client_id).await {
+                                    Ok(tdlib_rs::enums::Chat::Chat(chat)) => mapping::chat_title(&chat),
+                                    Err(_) => "Unknown sender".into(),
+                                }
+                            }
+                        };
+                        if let Some((chat_id, message)) = mapping::new_message(&update, sender_name)
+                            && events.send(BackendEvent::NewMessage { chat_id, message }).await.is_err() {
+                            break;
+                        }
+                    }
                 }
                 Some(_) => {}
                 None => break,

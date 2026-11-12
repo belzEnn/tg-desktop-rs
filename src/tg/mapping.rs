@@ -50,6 +50,23 @@ pub(super) fn message_sender(message: &tdlib_rs::types::Message) -> MessageSende
     }
 }
 
+pub(super) fn new_message_sender(update: &Update) -> Option<MessageSenderReference> {
+    let Update::NewMessage(update) = update else {
+        return None;
+    };
+    Some(message_sender(&update.message))
+}
+
+pub(super) fn new_message(update: &Update, sender_name: String) -> Option<(i64, ChatMessage)> {
+    let Update::NewMessage(update) = update else {
+        return None;
+    };
+    Some((
+        update.message.chat_id,
+        chat_message(update.message.clone(), sender_name),
+    ))
+}
+
 pub(super) fn chat_message(message: tdlib_rs::types::Message, sender_name: String) -> ChatMessage {
     let text = match message.content {
         MessageContent::MessageText(text) => text.text.text,

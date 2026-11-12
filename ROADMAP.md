@@ -76,7 +76,7 @@ measurements.
   the last 50 messages; retry when the first response is short or empty;
   chronological order; unsupported content shown as a placeholder.
 - **3.2 Load older messages.** ☐ "Load more" button (no infinite scroll yet).
-- **3.3 Live incoming messages.** ☐ New messages appear in the open chat
+- **3.3 Live incoming messages.** ✅ New messages appear in the open chat
   without reload.
 
 ## 4. Sending
