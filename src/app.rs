@@ -35,6 +35,9 @@ pub(crate) struct State {
     logout_pending: bool,
     chats: Vec<ChatSummary>,
     open_chat_id: Option<i64>,
+    window_focused: bool,
+    history_read: HistoryRead,
+    read_in_flight: Option<PendingRead>,
     messages: Vec<ChatMessage>,
     history_loading: bool,
     history_error: Option<String>,
@@ -66,6 +69,18 @@ pub(crate) struct MessageMenu {
     pub position: Point,
     pub actions: MessageActions,
     pub request_id: Option<u64>,
+}
+
+#[derive(Default)]
+struct HistoryRead {
+    viewed_through: i64,
+    accepted_through: i64,
+    failed_through: i64,
+}
+
+struct PendingRead {
+    request_id: u64,
+    address: MessageAddress,
 }
 
 struct PendingMutation {
@@ -105,6 +120,12 @@ pub(crate) enum Message {
     LogOut,
     LogoutCommandSent(Result<(), AdapterCommandError>),
     OpenChat(i64),
+    WindowFocusChanged(bool),
+    HistoryReadBoundary(MessageAddress),
+    ReadReceiptQueued {
+        request_id: u64,
+        result: Result<(), AdapterCommandError>,
+    },
     ChatOpenCommandSent(Result<(), AdapterCommandError>),
     HistoryScrolled {
         offset_y: f32,
@@ -160,6 +181,9 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
         logout_pending: false,
         chats: Vec::new(),
         open_chat_id: None,
+        window_focused: false,
+        history_read: HistoryRead::default(),
+        read_in_flight: None,
         messages: Vec::new(),
         history_loading: false,
         history_error: None,
@@ -192,11 +216,22 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
 
 /// Subscribes the application to backend events.
 pub(crate) fn subscription(state: &State) -> Subscription<Message> {
-    let backend = state.backend.subscription().map(Message::BackendEvent);
+    let events = Subscription::batch([
+        state.backend.subscription().map(Message::BackendEvent),
+        event::listen_with(window_focus_event),
+    ]);
     if state.message_menu.is_some() || state.edit.is_some() || state.delete_confirmation.is_some() {
-        Subscription::batch([backend, event::listen_with(message_menu_event)])
+        Subscription::batch([events, event::listen_with(message_menu_event)])
     } else {
-        backend
+        events
+    }
+}
+
+fn window_focus_event(event: Event, _: event::Status, _: window::Id) -> Option<Message> {
+    match event {
+        Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
+        Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
+        _ => None,
     }
 }
 
@@ -212,9 +247,7 @@ fn message_menu_event(event: Event, status: event::Status, _: window::Id) -> Opt
             Some(Message::DismissMessageMenu)
         }
         Event::Mouse(mouse::Event::WheelScrolled { .. })
-        | Event::Window(window::Event::Unfocused | window::Event::Resized(_)) => {
-            Some(Message::DismissMessageMenu)
-        }
+        | Event::Window(window::Event::Resized(_)) => Some(Message::DismissMessageMenu),
         _ => None,
     }
 }
@@ -229,6 +262,8 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.logout_pending = false;
                 state.chats.clear();
                 state.open_chat_id = None;
+                state.history_read = HistoryRead::default();
+                state.read_in_flight = None;
                 state.message_menu = None;
                 state.edit = None;
                 state.delete_confirmation = None;
@@ -273,12 +308,23 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.password.clear();
             state.logout_pending = false;
         }
-        Message::BackendEvent(BackendEvent::ChatUpdated(chat)) => {
+        Message::BackendEvent(BackendEvent::ChatUpdated(mut chat)) => {
             if let Some(existing) = state
                 .chats
                 .iter_mut()
                 .find(|existing| existing.id == chat.id)
             {
+                // A snapshot can overtake a queued inbox or outbox update.
+                if chat.last_read_inbox_message_id < existing.last_read_inbox_message_id {
+                    chat.last_read_inbox_message_id = existing.last_read_inbox_message_id;
+                    chat.unread_count = existing.unread_count;
+                }
+                if let (Some(read), Some(previous)) = (
+                    &mut chat.last_read_outbox_message_id,
+                    existing.last_read_outbox_message_id,
+                ) {
+                    *read = (*read).max(previous);
+                }
                 *existing = chat;
             } else {
                 state.chats.push(chat);
@@ -290,6 +336,34 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                     .then_with(|| right.id.cmp(&left.id))
             });
             state.chats.truncate(50);
+        }
+        Message::BackendEvent(BackendEvent::ChatInboxRead {
+            chat_id,
+            last_read_message_id,
+            unread_count,
+        }) => {
+            if let Some(chat) = state.chats.iter_mut().find(|chat| chat.id == chat_id)
+                && last_read_message_id >= chat.last_read_inbox_message_id
+            {
+                chat.last_read_inbox_message_id = last_read_message_id;
+                chat.unread_count = unread_count;
+            }
+        }
+        Message::BackendEvent(BackendEvent::ChatOutboxRead {
+            chat_id,
+            last_read_message_id,
+        }) => {
+            if let Some(chat) = state.chats.iter_mut().find(|chat| chat.id == chat_id)
+                && let Some(read) = &mut chat.last_read_outbox_message_id
+            {
+                *read = (*read).max(last_read_message_id);
+            }
+        }
+        Message::BackendEvent(BackendEvent::ReadReceiptFinished {
+            request_id,
+            accepted,
+        }) => {
+            return finish_read_receipt(state, request_id, accepted);
         }
         Message::BackendEvent(BackendEvent::ChatRemoved(chat_id)) => {
             state.chats.retain(|chat| chat.id != chat_id);
@@ -543,6 +617,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.message_menu = None;
             if state.open_chat_id != Some(chat_id) {
                 state.open_chat_id = Some(chat_id);
+                state.history_read = HistoryRead::default();
                 state.edit = None;
                 state.delete_confirmation = None;
                 state.message_action_error = None;
@@ -571,6 +646,36 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.history_error = Some(error.to_string());
         }
         Message::ChatOpenCommandSent(Ok(())) => {}
+        Message::WindowFocusChanged(focused) => {
+            state.window_focused = focused;
+            if focused {
+                state.history_read.failed_through = 0;
+            } else {
+                state.history_read.viewed_through = 0;
+                state.message_menu = None;
+            }
+        }
+        Message::HistoryReadBoundary(address) => {
+            if let Some(chat) = state.chats.iter().find(|chat| chat.id == address.chat_id)
+                && state
+                    .read_after(chat)
+                    .is_some_and(|after| address.message_id > after)
+                && state.messages.iter().any(|message| {
+                    message.id == address.message_id
+                        && message.can_reference
+                        && !message.is_outgoing
+                })
+            {
+                state.history_read.viewed_through =
+                    state.history_read.viewed_through.max(address.message_id);
+                return request_read_receipt(state);
+            }
+        }
+        Message::ReadReceiptQueued { request_id, result } => {
+            if result.is_err() {
+                return finish_read_receipt(state, request_id, false);
+            }
+        }
         Message::HistoryScrolled {
             offset_y,
             content_height,
@@ -922,6 +1027,59 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
     Task::none()
 }
 
+fn request_read_receipt(state: &mut State) -> Task<Message> {
+    let Some(chat) = state
+        .chats
+        .iter()
+        .find(|chat| Some(chat.id) == state.open_chat_id)
+    else {
+        return Task::none();
+    };
+    let message_id = state.history_read.viewed_through;
+    if state.read_in_flight.is_some()
+        || !state.can_mark_read(chat)
+        || message_id <= state.read_threshold(chat)
+    {
+        return Task::none();
+    }
+
+    let address = MessageAddress {
+        chat_id: chat.id,
+        message_id,
+    };
+    let request_id = state.action_request_id();
+    state.read_in_flight = Some(PendingRead {
+        request_id,
+        address,
+    });
+    let backend = state.backend.clone();
+    Task::perform(
+        async move { backend.mark_read(address, request_id).await },
+        move |result| Message::ReadReceiptQueued { request_id, result },
+    )
+}
+
+fn finish_read_receipt(state: &mut State, request_id: u64, accepted: bool) -> Task<Message> {
+    if !state
+        .read_in_flight
+        .as_ref()
+        .is_some_and(|pending| pending.request_id == request_id)
+    {
+        return Task::none();
+    }
+    if let Some(pending) = state.read_in_flight.take()
+        && state.open_chat_id == Some(pending.address.chat_id)
+    {
+        let threshold = if accepted {
+            &mut state.history_read.accepted_through
+        } else {
+            &mut state.history_read.failed_through
+        };
+        *threshold = (*threshold).max(pending.address.message_id);
+    }
+    request_read_receipt(state)
+}
+
 fn request_message_action(
     state: &State,
     request_id: u64,
@@ -1237,6 +1395,36 @@ impl State {
     pub(crate) fn chats(&self) -> &[ChatSummary] {
         &self.chats
     }
+    fn can_mark_read(&self, chat: &ChatSummary) -> bool {
+        self.authorization_state == Some(AuthorizationState::Ready)
+            && self.window_focused
+            && self.open_chat_id == Some(chat.id)
+            && !self.logout_pending
+            && !self.history_loading
+            && self.pending_scroll_adjustment.is_none()
+            && self.delete_confirmation.is_none()
+            && chat.unread_count > 0
+    }
+
+    fn read_threshold(&self, chat: &ChatSummary) -> i64 {
+        chat.last_read_inbox_message_id
+            .max(self.history_read.accepted_through)
+            .max(self.history_read.failed_through)
+    }
+
+    pub(crate) fn read_after(&self, chat: &ChatSummary) -> Option<i64> {
+        self.can_mark_read(chat).then(|| {
+            let mut after = self.read_threshold(chat);
+            if let Some(pending) = &self.read_in_flight {
+                if pending.address.chat_id == chat.id {
+                    after = after.max(pending.address.message_id);
+                }
+                after = after.max(self.history_read.viewed_through);
+            }
+            after
+        })
+    }
+
     pub(crate) fn open_chat_id(&self) -> Option<i64> {
         self.open_chat_id
     }
@@ -1516,5 +1704,148 @@ mod tests {
         );
         assert!(state.messages.is_empty());
         assert!(state.delete_confirmation().is_none());
+    }
+
+    fn unread_chat(id: i64) -> ChatSummary {
+        ChatSummary {
+            id,
+            title: "Chat".into(),
+            last_message_id: Some(5),
+            last_message_preview: "latest".into(),
+            unread_count: 4,
+            last_read_inbox_message_id: 1,
+            last_read_outbox_message_id: Some(0),
+            position: 1,
+            can_receive_forwards: true,
+        }
+    }
+
+    fn unread_conversation() -> State {
+        let (mut state, _) = boot(Adapter::for_tests());
+        state.authorization_state = Some(AuthorizationState::Ready);
+        state.open_chat_id = Some(10);
+        state.chats.push(unread_chat(10));
+        state.messages = (2..=5).map(message).collect();
+        state
+    }
+
+    fn viewed(state: &mut State, chat_id: i64, message_id: i64) {
+        let _ = update(
+            state,
+            Message::HistoryReadBoundary(MessageAddress {
+                chat_id,
+                message_id,
+            }),
+        );
+    }
+
+    fn finish_read(state: &mut State, accepted: bool) {
+        let request_id = state.read_in_flight.as_ref().unwrap().request_id;
+        let _ = update(
+            state,
+            Message::BackendEvent(BackendEvent::ReadReceiptFinished {
+                request_id,
+                accepted,
+            }),
+        );
+    }
+
+    #[test]
+    fn active_chat_coalesces_viewed_boundaries_without_guessing_unread_count() {
+        let mut state = unread_conversation();
+        let _ = update(&mut state, Message::WindowFocusChanged(true));
+
+        viewed(&mut state, 10, 2);
+        viewed(&mut state, 10, 2);
+        viewed(&mut state, 10, 3);
+        viewed(&mut state, 10, 5);
+        assert_eq!(state.read_in_flight.as_ref().unwrap().address.message_id, 2);
+        finish_read(&mut state, true);
+        assert_eq!(state.read_in_flight.as_ref().unwrap().address.message_id, 5);
+
+        finish_read(&mut state, true);
+        viewed(&mut state, 10, 5);
+        assert!(state.read_in_flight.is_none());
+        assert_eq!(state.chats[0].unread_count, 4);
+
+        let _ = update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::ChatInboxRead {
+                chat_id: 10,
+                last_read_message_id: 5,
+                unread_count: 0,
+            }),
+        );
+        let _ = update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::ChatInboxRead {
+                chat_id: 10,
+                last_read_message_id: 2,
+                unread_count: 3,
+            }),
+        );
+        assert_eq!(state.chats[0].unread_count, 0);
+        assert_eq!(state.chats[0].last_read_inbox_message_id, 5);
+    }
+
+    #[test]
+    fn background_window_and_stale_chat_geometry_do_not_mark_messages() {
+        let mut state = unread_conversation();
+        viewed(&mut state, 10, 5);
+        assert!(state.read_in_flight.is_none());
+
+        let _ = update(&mut state, Message::WindowFocusChanged(true));
+        viewed(&mut state, 10, 2);
+        viewed(&mut state, 10, 5);
+        let _ = update(&mut state, Message::WindowFocusChanged(false));
+        finish_read(&mut state, true);
+        assert!(state.read_in_flight.is_none());
+
+        let _ = update(&mut state, Message::WindowFocusChanged(true));
+        let _ = update(&mut state, Message::OpenChat(20));
+        viewed(&mut state, 10, 5);
+        assert!(state.read_in_flight.is_none());
+    }
+
+    #[test]
+    fn failed_receipt_waits_for_a_fresh_focus_or_newer_message() {
+        let mut state = unread_conversation();
+        let _ = update(&mut state, Message::WindowFocusChanged(true));
+        viewed(&mut state, 10, 5);
+        finish_read(&mut state, false);
+        viewed(&mut state, 10, 5);
+        assert!(state.read_in_flight.is_none());
+
+        let _ = update(&mut state, Message::WindowFocusChanged(false));
+        let _ = update(&mut state, Message::WindowFocusChanged(true));
+        viewed(&mut state, 10, 5);
+        assert!(state.read_in_flight.is_some());
+    }
+
+    #[test]
+    fn outbox_read_boundary_advances_only_for_the_reported_chat() {
+        let mut state = unread_conversation();
+        let mut unsupported = unread_chat(20);
+        unsupported.last_read_outbox_message_id = None;
+        state.chats.push(unsupported);
+        for (chat_id, last_read_message_id) in [(10, 4), (10, 2), (20, 5)] {
+            let _ = update(
+                &mut state,
+                Message::BackendEvent(BackendEvent::ChatOutboxRead {
+                    chat_id,
+                    last_read_message_id,
+                }),
+            );
+        }
+        let _ = update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::ChatUpdated(unread_chat(10))),
+        );
+
+        let private_chat = state.chats.iter().find(|chat| chat.id == 10).unwrap();
+        assert_eq!(private_chat.last_read_outbox_message_id, Some(4));
+        assert_eq!(private_chat.unread_count, 4);
+        let unsupported = state.chats.iter().find(|chat| chat.id == 20).unwrap();
+        assert_eq!(unsupported.last_read_outbox_message_id, None);
     }
 }

@@ -134,3 +134,16 @@ rows and related previews in place.
 RSS after login, after opening a 50-message chat, and after one idle hour
 remains pending, along with edit and delete latency and an end-to-end check
 against Telegram's test DC.
+
+## Phase 6.3 — mark messages as read
+
+The visible history uses existing layout bounds and a binary search to find
+the bottommost eligible row. It allocates no per-message visibility cache.
+Read boundaries are coalesced into one request at a time. Inbox updates
+apply the count directly without querying the chat again. Outgoing checks
+use one boundary per listed private chat. TDLib provides the account user
+ID at sign-in so Saved Messages can be excluded.
+
+RSS after login, after opening a 50-message chat, and after one idle hour
+remains pending, along with the delay from viewing a message to the unread
+count changing on Telegram's test DC.

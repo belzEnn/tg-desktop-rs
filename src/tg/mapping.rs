@@ -20,11 +20,19 @@ pub(super) enum MessageSenderReference {
     Chat(i64),
 }
 
-pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
+pub(super) fn chat(chat: &Chat, account_user_id: Option<i64>) -> Option<ChatSummary> {
     let position = chat
         .positions
         .iter()
         .find(|position| position.list == TdChatList::Main)?;
+    let last_read_outbox_message_id = match &chat.r#type {
+        tdlib_rs::enums::ChatType::Private(peer)
+            if account_user_id.is_some_and(|account| account != peer.user_id) =>
+        {
+            Some(chat.last_read_outbox_message_id)
+        }
+        _ => None,
+    };
     Some(ChatSummary {
         id: chat.id,
         title: chat.title.clone(),
@@ -37,6 +45,8 @@ pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
             },
         ),
         unread_count: chat.unread_count.max(0) as u32,
+        last_read_inbox_message_id: chat.last_read_inbox_message_id,
+        last_read_outbox_message_id,
         position: position.order,
         can_receive_forwards: !matches!(chat.r#type, tdlib_rs::enums::ChatType::Secret(_)),
     })
@@ -163,6 +173,15 @@ pub(super) fn message_actions(properties: tdlib_rs::enums::MessageProperties) ->
 
 pub(super) fn message_change(update: Update) -> Option<BackendEvent> {
     match update {
+        Update::ChatReadInbox(update) => Some(BackendEvent::ChatInboxRead {
+            chat_id: update.chat_id,
+            last_read_message_id: update.last_read_inbox_message_id,
+            unread_count: update.unread_count.max(0) as u32,
+        }),
+        Update::ChatReadOutbox(update) => Some(BackendEvent::ChatOutboxRead {
+            chat_id: update.chat_id,
+            last_read_message_id: update.last_read_outbox_message_id,
+        }),
         Update::MessageContent(update) => {
             let (text, is_text) = display_content(update.new_content);
             Some(BackendEvent::MessageContentChanged {
@@ -188,6 +207,11 @@ pub(super) fn message_change(update: Update) -> Option<BackendEvent> {
         }
         _ => None,
     }
+}
+
+pub(super) fn user_id(user: tdlib_rs::enums::User) -> i64 {
+    let tdlib_rs::enums::User::User(user) = user;
+    user.id
 }
 
 pub(super) fn user_name(user: &tdlib_rs::types::User) -> String {
@@ -221,7 +245,6 @@ pub(super) fn chat_update_id(update: &Update) -> Option<i64> {
         Update::ChatRemovedFromList(update) if update.chat_list == TdChatList::Main => {
             Some(update.chat_id)
         }
-        Update::ChatReadInbox(update) => Some(update.chat_id),
         _ => None,
     }
 }

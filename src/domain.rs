@@ -39,6 +39,22 @@ pub enum BackendEvent {
     ChatUpdated(ChatSummary),
     /// A chat was removed from the main list.
     ChatRemoved(i64),
+    /// TDLib's latest read boundary and unread count for a chat.
+    ChatInboxRead {
+        chat_id: i64,
+        last_read_message_id: i64,
+        unread_count: u32,
+    },
+    /// TDLib advanced the read boundary for outgoing messages.
+    ChatOutboxRead {
+        chat_id: i64,
+        last_read_message_id: i64,
+    },
+    /// TDLib accepted or rejected a viewed-message notification.
+    ReadReceiptFinished {
+        request_id: u64,
+        accepted: bool,
+    },
     /// The requested chat history was loaded.
     ChatHistoryLoaded {
         chat_id: i64,
@@ -225,6 +241,9 @@ pub struct ChatSummary {
     pub last_message_id: Option<i64>,
     pub last_message_preview: String,
     pub unread_count: u32,
+    pub last_read_inbox_message_id: i64,
+    /// Read boundary in a private chat with another user. Zero means none read.
+    pub last_read_outbox_message_id: Option<i64>,
     pub position: i64,
     pub can_receive_forwards: bool,
 }

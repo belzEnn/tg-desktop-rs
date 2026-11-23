@@ -65,6 +65,10 @@ enum BackendCommand {
     SubmitCode(String),
     SubmitPassword(String),
     OpenChat(i64),
+    MarkRead {
+        address: MessageAddress,
+        request_id: u64,
+    },
     LoadOlderMessages {
         chat_id: i64,
         before_message_id: i64,
@@ -247,6 +251,19 @@ impl Adapter {
             .map_err(|_| AdapterCommandError::WorkerStopped)
     }
 
+    /// Reports the most recent incoming message viewed in the open chat.
+    pub(crate) async fn mark_read(
+        &self,
+        address: MessageAddress,
+        request_id: u64,
+    ) -> Result<(), AdapterCommandError> {
+        self.send_command(BackendCommand::MarkRead {
+            address,
+            request_id,
+        })
+        .await
+    }
+
     /// Loads the messages before the oldest message currently shown in a chat.
     pub(crate) async fn load_older_messages(
         &self,
@@ -389,6 +406,8 @@ async fn run_supervisor(
     let mut client_id = initial_client_id;
     let mut client_closed = false;
     let mut main_chats_loaded = false;
+    let mut account_user_id = None;
+    let mut open_chat_id = None;
     let mut pending_message_ids = HashMap::new();
     let mut pending_forward = None;
     let mut background_requests = JoinSet::new();
@@ -417,7 +436,7 @@ async fn run_supervisor(
                                 break;
                             }
                             if state == AuthorizationState::Ready && !main_chats_loaded {
-                                main_chats_loaded = load_main_chats(client_id, &events).await;
+                                main_chats_loaded = load_main_chats(client_id, &mut account_user_id, &events).await;
                             }
                         }
                         Err(error) => {
@@ -458,6 +477,7 @@ async fn run_supervisor(
                     }
                 }
                 Some(BackendCommand::OpenChat(chat_id)) => {
+                    open_chat_id = None;
                     if let Err(error) = tdlib_rs::functions::open_chat(chat_id, client_id).await {
                         let _ = events.send(BackendEvent::ChatHistoryError {
                             chat_id,
@@ -465,6 +485,7 @@ async fn run_supervisor(
                         }).await;
                         continue;
                     }
+                    open_chat_id = Some(chat_id);
                     let mut messages: Vec<ChatMessage> = Vec::with_capacity(CHAT_HISTORY_LIMIT);
                     let mut from_message_id = 0;
                     let mut first_request = true;
@@ -511,6 +532,30 @@ async fn run_supervisor(
                         messages,
                         has_older_messages,
                     }).await;
+                }
+                Some(BackendCommand::MarkRead { address, request_id }) => {
+                    if open_chat_id == Some(address.chat_id) && !client_closed {
+                        background_requests.spawn(async move {
+                            let accepted = match tdlib_rs::functions::view_messages(
+                                address.chat_id,
+                                vec![address.message_id],
+                                Some(tdlib_rs::enums::MessageSource::ChatHistory),
+                                false,
+                                client_id,
+                            ).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::debug!(code = error.code, "TDLib rejected read receipt");
+                                    false
+                                }
+                            };
+                            BackendEvent::ReadReceiptFinished { request_id, accepted }
+                        });
+                    } else {
+                        let _ = events.send(BackendEvent::ReadReceiptFinished {
+                            request_id, accepted: false,
+                        }).await;
+                    }
                 }
                 Some(BackendCommand::LoadOlderMessages { chat_id, before_message_id }) => {
                     match tdlib_rs::functions::get_chat_history(
@@ -599,6 +644,8 @@ async fn run_supervisor(
                         if state == AuthorizationState::Closed {
                             client_closed = true;
                             main_chats_loaded = false;
+                            account_user_id = None;
+                            open_chat_id = None;
                             pending_message_ids.clear();
                             pending_forward = None;
                         }
@@ -606,7 +653,7 @@ async fn run_supervisor(
                             break;
                         }
                         if state == AuthorizationState::Ready && !main_chats_loaded {
-                            main_chats_loaded = load_main_chats(client_id, &events).await;
+                            main_chats_loaded = load_main_chats(client_id, &mut account_user_id, &events).await;
                         }
                         if state == AuthorizationState::WaitTdlibParameters
                             && let Some(error) = configure_tdlib(
@@ -625,7 +672,7 @@ async fn run_supervisor(
                             break;
                         }
                     } else if let tdlib_rs::enums::Update::NewChat(new_chat) = &update {
-                        match mapping::chat(&new_chat.chat) {
+                        match mapping::chat(&new_chat.chat, account_user_id) {
                             Some(chat) => {
                                 if events.send(BackendEvent::ChatUpdated(chat)).await.is_err() {
                                     break;
@@ -639,7 +686,7 @@ async fn run_supervisor(
                     } else if let Some(chat_id) = mapping::chat_update_id(&update) {
                         match tdlib_rs::functions::get_chat(chat_id, client_id).await {
                             Ok(tdlib_rs::enums::Chat::Chat(td_chat)) => {
-                                match mapping::chat(&td_chat) {
+                                match mapping::chat(&td_chat, account_user_id) {
                                     Some(chat) => {
                                         if events.send(BackendEvent::ChatUpdated(chat)).await.is_err() {
                                             break;
@@ -731,6 +778,8 @@ async fn run_supervisor(
                             if state == AuthorizationState::Closed {
                                 client_closed = true;
                                 main_chats_loaded = false;
+                                account_user_id = None;
+                                open_chat_id = None;
                                 pending_message_ids.clear();
                                 pending_forward = None;
                             }
@@ -738,7 +787,7 @@ async fn run_supervisor(
                                 break;
                             }
                             if state == AuthorizationState::Ready {
-                                main_chats_loaded = load_main_chats(client_id, &events).await;
+                                main_chats_loaded = load_main_chats(client_id, &mut account_user_id, &events).await;
                             } else if state == AuthorizationState::WaitTdlibParameters
                                 && let Some(error) = configure_tdlib(
                                     client_id,
@@ -924,7 +973,18 @@ async fn cached_sender_name(
     name
 }
 
-async fn load_main_chats(client_id: i32, events: &mpsc::Sender<BackendEvent>) -> bool {
+async fn load_main_chats(
+    client_id: i32,
+    account_user_id: &mut Option<i64>,
+    events: &mpsc::Sender<BackendEvent>,
+) -> bool {
+    if account_user_id.is_none() {
+        *account_user_id = tdlib_rs::functions::get_me(client_id)
+            .await
+            .ok()
+            .map(mapping::user_id);
+    }
+
     let load_result = tdlib_rs::functions::load_chats(
         Some(tdlib_rs::enums::ChatList::Main),
         CHAT_LIST_LIMIT,
@@ -962,7 +1022,7 @@ async fn load_main_chats(client_id: i32, events: &mpsc::Sender<BackendEvent>) ->
     for chat_id in chat_ids {
         match tdlib_rs::functions::get_chat(chat_id, client_id).await {
             Ok(tdlib_rs::enums::Chat::Chat(chat)) => {
-                if let Some(chat) = mapping::chat(&chat) {
+                if let Some(chat) = mapping::chat(&chat, *account_user_id) {
                     if events.send(BackendEvent::ChatUpdated(chat)).await.is_err() {
                         return false;
                     }

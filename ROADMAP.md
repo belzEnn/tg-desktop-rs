@@ -104,8 +104,9 @@ measurements.
 - **6.2 Edit and delete.** 🚧 Edit or delete your own messages from the context
   menu. History updates live. Test-DC verification and RSS measurements
   pending.
-- **6.3 Mark as read.** ☐ Mark messages read when viewed; unread counters stay
-  consistent.
+- **6.3 Mark as read.** 🚧 Mark viewed messages in the focused window,
+  refresh unread counters from TDLib, and show read checks for outgoing
+  messages in private chats. Test-DC verification and RSS measurements pending.
 - **6.4 Text entities.** ☐ Bold, italic, underline, strikethrough, `code`,
   `pre` and links in message text; malformed spans dropped, unknown types
   ignored.
