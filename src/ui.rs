@@ -9,14 +9,14 @@ use iced::{
     keyboard::{Key, key::Named},
     mouse,
     widget::{
-        button, column, container, mouse_area, opaque, pin, responsive, row, scrollable, space,
-        stack, text, text_editor, text_input,
+        button, center, column, container, mouse_area, opaque, pin, responsive, row, scrollable,
+        space, stack, text, text_editor, text_input,
     },
 };
 
 use crate::{
     app,
-    domain::{AuthorizationState, MessagePreview},
+    domain::{AuthorizationState, DeleteScope, MessagePreview},
     tg::Adapter,
 };
 
@@ -160,24 +160,22 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     history = history.push(text(error));
                 }
                 for message in state.messages() {
-                    let mut body = column![text(&message.sender_name).size(12)].spacing(3);
+                    let sender = text(&message.sender_name).size(12);
+                    let mut body = if message.is_edited {
+                        column![row![sender, text("edited").size(12)].spacing(8)]
+                    } else {
+                        column![sender]
+                    }
+                    .spacing(3);
                     if let Some(origin) = &message.forwarded_from {
                         body = body.push(text(format!("Forwarded from {origin}")).size(12));
                     }
                     if let Some(reply) = &message.reply {
-                        let (sender, snippet) = match &reply.preview {
-                            Some(preview) => {
-                                (preview.sender_name.as_deref(), preview.text.as_ref())
-                            }
-                            None => (
-                                None,
-                                reply
-                                    .quote
-                                    .as_deref()
-                                    .unwrap_or("Loading original message…"),
-                            ),
-                        };
-                        body = body.push(reply_preview(sender, snippet));
+                        let sender = reply
+                            .preview
+                            .as_ref()
+                            .and_then(|preview| preview.sender_name.as_deref());
+                        body = body.push(reply_preview(sender, reply.display_text()));
                     }
                     body =
                         body.push(text(&message.text).wrapping(iced::widget::text::Wrapping::Word));
@@ -194,6 +192,8 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
             } else {
                 history = history.push(text("Select a chat to view its messages."));
             }
+            let editing = state.is_editing();
+            let editing_pending = editing && state.mutation_pending();
             let composer = text_editor(state.composer())
                 .id(app::CHAT_COMPOSER_ID)
                 .placeholder("Write a message")
@@ -265,7 +265,28 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                 if let Some(status) = state.forward_status() {
                     conversation = conversation.push(text(status));
                 }
-                if let Some(original) = state.reply_message() {
+                if state.delete_confirmation().is_none()
+                    && let Some(error) = state.message_action_error()
+                {
+                    conversation = conversation.push(text(error));
+                }
+                if editing {
+                    conversation = conversation.push(
+                        row![
+                            text(if editing_pending {
+                                "Saving changes…"
+                            } else {
+                                "Editing message"
+                            })
+                            .width(Fill),
+                            button("Cancel").on_press_maybe(
+                                (!editing_pending).then_some(app::Message::CancelEdit)
+                            ),
+                        ]
+                        .align_y(iced::Alignment::Center)
+                        .spacing(8),
+                    );
+                } else if let Some(original) = state.reply_message() {
                     let snippet = MessagePreview::snippet(&original.text);
                     conversation = conversation.push(
                         row![
@@ -277,9 +298,13 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     );
                 }
                 conversation = conversation.push(
-                    row![composer, button("Send").on_press(app::Message::Submit),]
-                        .spacing(8)
-                        .align_y(iced::Alignment::End),
+                    row![
+                        composer,
+                        button(if editing { "Save" } else { "Send" })
+                            .on_press_maybe((!editing_pending).then_some(app::Message::Submit)),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::End),
                 );
             }
             let chat_area = column![
@@ -301,13 +326,34 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
             let mut layers = stack![row![sidebar, chat_area].width(Fill).height(Fill)]
                 .width(Fill)
                 .height(Fill);
-            if let Some(menu) = state.message_menu() {
+            if let Some(confirmation) = state.delete_confirmation() {
+                layers = layers
+                    .push(opaque(
+                        mouse_area(space().width(Fill).height(Fill))
+                            .on_press(app::Message::CancelDelete),
+                    ))
+                    .push(delete_confirmation(
+                        confirmation,
+                        state
+                            .messages()
+                            .iter()
+                            .find(|message| message.id == confirmation.message_id)
+                            .map(|message| message.text.as_str()),
+                        state.mutation_pending(),
+                        state.message_action_error(),
+                    ));
+            } else if let Some(menu) = state.message_menu() {
                 layers = layers
                     .push(
                         mouse_area(space().width(Fill).height(Fill))
                             .on_press(app::Message::DismissMessageMenu),
                     )
-                    .push(message_menu(menu, !state.forward_pending()));
+                    .push(message_menu(
+                        menu,
+                        !editing,
+                        !state.forward_pending(),
+                        !editing && !state.mutation_pending(),
+                    ));
             }
             return layers.into();
         }
@@ -329,41 +375,132 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
     scrollable(content).into()
 }
 
-const MENU_WIDTH: f32 = 140.0;
-const MENU_HEIGHT: f32 = 76.0;
+const MENU_WIDTH: f32 = 152.0;
+const MENU_ITEM_HEIGHT: f32 = 30.0;
+const MENU_PADDING: f32 = 6.0;
+const MENU_SPACING: f32 = 4.0;
 
-fn message_menu(menu: app::MessageMenu, can_forward: bool) -> Element<'static, app::Message> {
+fn message_menu(
+    menu: app::MessageMenu,
+    can_reply: bool,
+    can_forward: bool,
+    can_change: bool,
+) -> Element<'static, app::Message> {
     responsive(move |available| {
-        let actions = column![
-            button("Reply")
-                .width(Fill)
-                .height(30)
-                .on_press(app::Message::SelectReply(menu.message_id)),
-            button("Forward")
-                .width(Fill)
-                .height(30)
-                .on_press_maybe(can_forward.then_some(app::Message::StartForward(menu.message_id))),
+        let mut actions = column![
+            menu_button(
+                "Reply",
+                can_reply.then_some(app::Message::SelectReply(menu.message_id))
+            ),
+            menu_button(
+                "Forward",
+                can_forward.then_some(app::Message::StartForward(menu.message_id))
+            ),
         ]
-        .spacing(4);
+        .spacing(MENU_SPACING);
+        let mut item_count = 2;
+        if menu.actions.can_edit {
+            actions = actions.push(menu_button(
+                "Edit",
+                can_change.then_some(app::Message::StartEdit(menu.message_id)),
+            ));
+            item_count += 1;
+        }
+        if menu.actions.can_delete_for_self || menu.actions.can_delete_for_everyone {
+            actions = actions.push(menu_button(
+                "Delete",
+                can_change.then_some(app::Message::ShowDeleteConfirmation(menu.message_id)),
+            ));
+            item_count += 1;
+        }
+        if menu.request_id.is_some() {
+            actions = actions.push(
+                container(text("Checking actions…").size(12))
+                    .height(MENU_ITEM_HEIGHT)
+                    .center_y(MENU_ITEM_HEIGHT),
+            );
+            item_count += 1;
+        }
+        let height = MENU_PADDING * 2.0
+            + MENU_ITEM_HEIGHT * item_count as f32
+            + MENU_SPACING * (item_count - 1) as f32;
         let panel = container(actions)
             .width(MENU_WIDTH)
-            .height(MENU_HEIGHT)
-            .padding(6)
+            .height(height)
+            .padding(MENU_PADDING)
             .style(container::rounded_box);
         pin(opaque(panel))
-            .position(menu_position(menu.position, available))
+            .position(menu_position(menu.position, available, height))
             .into()
     })
     .into()
 }
 
-fn menu_position(cursor: Point, available: Size) -> Point {
+fn menu_button(
+    label: &'static str,
+    action: Option<app::Message>,
+) -> iced::widget::Button<'static, app::Message> {
+    button(label)
+        .width(Fill)
+        .height(MENU_ITEM_HEIGHT)
+        .on_press_maybe(action)
+}
+
+fn menu_position(cursor: Point, available: Size, height: f32) -> Point {
     Point::new(
         cursor.x.clamp(0.0, (available.width - MENU_WIDTH).max(0.0)),
-        cursor
-            .y
-            .clamp(0.0, (available.height - MENU_HEIGHT).max(0.0)),
+        cursor.y.clamp(0.0, (available.height - height).max(0.0)),
     )
+}
+
+fn delete_confirmation<'a>(
+    confirmation: &app::DeleteConfirmation,
+    original: Option<&str>,
+    pending: bool,
+    error: Option<&'a str>,
+) -> Element<'a, app::Message> {
+    let mut actions = row![
+        button(if pending { "Close" } else { "Cancel" }).on_press(app::Message::CancelDelete),
+    ]
+    .spacing(8);
+    if confirmation.actions.can_delete_for_self {
+        actions = actions.push(
+            button("Delete for me")
+                .style(button::danger)
+                .on_press_maybe(
+                    (!pending).then_some(app::Message::ConfirmDelete(DeleteScope::ForSelf)),
+                ),
+        );
+    }
+    if confirmation.actions.can_delete_for_everyone {
+        actions = actions.push(
+            button("Delete for everyone")
+                .style(button::danger)
+                .on_press_maybe(
+                    (!pending).then_some(app::Message::ConfirmDelete(DeleteScope::ForEveryone)),
+                ),
+        );
+    }
+    let mut dialog = column![
+        text(if pending {
+            "Deleting message…"
+        } else {
+            "Delete this message?"
+        })
+        .size(18),
+    ]
+    .spacing(12);
+    if let Some(original) = original {
+        dialog = dialog.push(text(MessagePreview::snippet(original).into_string()).size(13));
+    }
+    dialog = dialog.push(actions);
+    if let Some(error) = error {
+        dialog = dialog.push(text(error));
+    }
+    center(opaque(
+        container(dialog).padding(16).style(container::rounded_box),
+    ))
+    .into()
 }
 
 #[derive(Clone)]
@@ -541,15 +678,15 @@ mod tests {
     fn context_menu_stays_inside_the_window() {
         let window = Size::new(800.0, 600.0);
         assert_eq!(
-            menu_position(Point::new(200.0, 300.0), window),
+            menu_position(Point::new(200.0, 300.0), window, 76.0),
             Point::new(200.0, 300.0)
         );
         assert_eq!(
-            menu_position(Point::new(799.0, 599.0), window),
-            Point::new(660.0, 524.0)
+            menu_position(Point::new(799.0, 599.0), window, 144.0),
+            Point::new(648.0, 456.0)
         );
         assert_eq!(
-            menu_position(Point::new(10.0, 10.0), Size::new(80.0, 50.0)),
+            menu_position(Point::new(10.0, 10.0), Size::new(80.0, 50.0), 76.0),
             Point::ORIGIN
         );
     }

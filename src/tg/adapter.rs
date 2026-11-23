@@ -20,7 +20,9 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-use crate::domain::{AuthorizationState, BackendEvent, ChatMessage};
+use crate::domain::{
+    AuthorizationState, BackendEvent, ChatMessage, DeleteScope, MessageAction, MessageAddress,
+};
 
 use super::mapping;
 
@@ -76,6 +78,11 @@ enum BackendCommand {
     ResolveReplies {
         chat_id: i64,
         message_ids: Vec<i64>,
+    },
+    MessageAction {
+        address: MessageAddress,
+        request_id: u64,
+        action: MessageAction,
     },
     Forward {
         from_chat_id: i64,
@@ -184,6 +191,19 @@ impl Adapter {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let (commands, _) = mpsc::channel(1);
+        let (_, events) = mpsc::channel(1);
+        Self {
+            commands,
+            events: SubscriptionSource {
+                id: NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
+                receiver: Arc::new(Mutex::new(events)),
+            },
+        }
+    }
+
     /// Starts TDLib authorization and sets its internal log verbosity.
     pub(crate) async fn initialize(&self) -> Result<(), AdapterCommandError> {
         self.commands
@@ -287,6 +307,21 @@ impl Adapter {
         .await
     }
 
+    /// Inspects or changes a message through the TDLib worker.
+    pub(crate) async fn message_action(
+        &self,
+        address: MessageAddress,
+        request_id: u64,
+        action: MessageAction,
+    ) -> Result<(), AdapterCommandError> {
+        self.send_command(BackendCommand::MessageAction {
+            address,
+            request_id,
+            action,
+        })
+        .await
+    }
+
     async fn send_command(&self, command: BackendCommand) -> Result<(), AdapterCommandError> {
         self.commands
             .send(command)
@@ -356,10 +391,10 @@ async fn run_supervisor(
     let mut main_chats_loaded = false;
     let mut pending_message_ids = HashMap::new();
     let mut pending_forward = None;
-    let mut reply_lookups = JoinSet::new();
+    let mut background_requests = JoinSet::new();
     loop {
         tokio::select! {
-            Some(result) = reply_lookups.join_next(), if !reply_lookups.is_empty() => {
+            Some(result) = background_requests.join_next(), if !background_requests.is_empty() => {
                 if let Ok(event) = result
                     && events.send(event).await.is_err()
                 {
@@ -510,7 +545,7 @@ async fn run_supervisor(
                     }
                 }
                 Some(BackendCommand::SendText { chat_id, message_id, text, reply_to }) => {
-                    let content = mapping::input_text_content(text.clone());
+                    let content = mapping::input_text_content(text.clone(), true);
                     match tdlib_rs::functions::send_message(
                         chat_id, None, reply_to.map(mapping::input_reply), None, content, client_id,
                     ).await {
@@ -529,7 +564,16 @@ async fn run_supervisor(
                     }
                 }
                 Some(BackendCommand::ResolveReplies { chat_id, message_ids }) => {
-                    reply_lookups.spawn(resolve_replies(chat_id, message_ids, client_id));
+                    background_requests.spawn(resolve_replies(chat_id, message_ids, client_id));
+                }
+                Some(BackendCommand::MessageAction { address, request_id, action }) => {
+                    let inspect = matches!(action, MessageAction::Inspect);
+                    let request = perform_message_action(address, request_id, action, client_id);
+                    if inspect {
+                        let _ = events.send(request.await).await;
+                    } else {
+                        background_requests.spawn(request);
+                    }
                 }
                 Some(BackendCommand::Forward { from_chat_id, message_id, to_chat_id }) => {
                     match forward_message(from_chat_id, message_id, to_chat_id, client_id).await {
@@ -660,7 +704,13 @@ async fn run_supervisor(
                                 }).await;
                             }
                         }
-                        _ => {}
+                        update => {
+                            if let Some(event) = mapping::message_change(update)
+                                && events.send(event).await.is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                 }
                 Some(_) => {}
@@ -729,6 +779,47 @@ async fn resolve_sender_name(sender: mapping::MessageSenderReference, client_id:
             }
         }
     }
+}
+
+async fn perform_message_action(
+    address: MessageAddress,
+    request_id: u64,
+    action: MessageAction,
+    client_id: i32,
+) -> BackendEvent {
+    let MessageAddress {
+        chat_id,
+        message_id,
+    } = address;
+    let result = match action {
+        MessageAction::Inspect => {
+            let result =
+                tdlib_rs::functions::get_message_properties(chat_id, message_id, client_id)
+                    .await
+                    .map(mapping::message_actions)
+                    .map_err(|_| "Couldn't load message actions.".into());
+            return BackendEvent::MessageActionsLoaded { request_id, result };
+        }
+        MessageAction::Edit(text) => {
+            let content = mapping::input_text_content(text, false);
+            tdlib_rs::functions::edit_message_text(chat_id, message_id, content, client_id)
+                .await
+                .map(|_| ())
+                .or_else(|error| match error.message.as_str() {
+                    "MESSAGE_NOT_MODIFIED" => Ok(()),
+                    _ => Err("Telegram couldn't edit the message.".into()),
+                })
+        }
+        MessageAction::Delete(scope) => tdlib_rs::functions::delete_messages(
+            chat_id,
+            vec![message_id],
+            scope == DeleteScope::ForEveryone,
+            client_id,
+        )
+        .await
+        .map_err(|_| "Telegram couldn't delete the message.".into()),
+    };
+    BackendEvent::MessageMutationFinished { request_id, result }
 }
 
 async fn resolve_replies(chat_id: i64, message_ids: Vec<i64>, client_id: i32) -> BackendEvent {

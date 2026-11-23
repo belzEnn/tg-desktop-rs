@@ -75,6 +75,29 @@ pub enum BackendEvent {
         text: String,
         reason: String,
     },
+    /// Permissions for the message whose context menu was opened.
+    MessageActionsLoaded {
+        request_id: u64,
+        result: Result<MessageActions, String>,
+    },
+    /// Telegram finished a requested edit or deletion.
+    MessageMutationFinished {
+        request_id: u64,
+        result: Result<(), String>,
+    },
+    /// The display content of a message changed on Telegram.
+    MessageContentChanged {
+        address: MessageAddress,
+        text: String,
+        is_text: bool,
+    },
+    /// Telegram marked a message as edited.
+    MessageEdited(MessageAddress),
+    /// Messages were deleted or became inaccessible.
+    MessagesDeleted {
+        chat_id: i64,
+        message_ids: Vec<i64>,
+    },
     /// A bounded batch of previews resolved for the active conversation.
     ReplyPreviewsLoaded {
         chat_id: i64,
@@ -92,6 +115,35 @@ pub enum BackendEvent {
     },
 }
 
+/// Identifies a message within its chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageAddress {
+    pub chat_id: i64,
+    pub message_id: i64,
+}
+
+/// Actions Telegram currently allows for a message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageActions {
+    pub can_edit: bool,
+    pub can_delete_for_self: bool,
+    pub can_delete_for_everyone: bool,
+}
+
+/// The recipients for whom a message should be deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteScope {
+    ForSelf,
+    ForEveryone,
+}
+
+/// A request to inspect or change a message.
+pub enum MessageAction {
+    Inspect,
+    Edit(String),
+    Delete(DeleteScope),
+}
+
 /// A message row with backend-independent display text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -101,6 +153,8 @@ pub struct ChatMessage {
     pub text: String,
     pub is_outgoing: bool,
     pub can_reference: bool,
+    pub is_text: bool,
+    pub is_edited: bool,
     pub reply: Option<Box<MessageReply>>,
     pub forwarded_from: Option<Box<str>>,
 }
@@ -144,13 +198,20 @@ impl MessagePreview {
 }
 
 impl MessageReply {
+    pub fn display_text(&self) -> &str {
+        self.quote
+            .as_deref()
+            .or_else(|| self.preview.as_ref().map(|preview| preview.text.as_ref()))
+            .unwrap_or("Loading original message…")
+    }
+
     pub fn resolve(&mut self, preview: Option<MessagePreview>) {
         let mut preview = preview.unwrap_or_else(|| MessagePreview {
             sender_name: None,
             text: "Original message unavailable".into(),
         });
-        if let Some(quote) = self.quote.take() {
-            preview.text = quote;
+        if self.quote.is_some() {
+            preview.text = Box::default();
         }
         self.preview = Some(preview);
     }
@@ -161,6 +222,7 @@ impl MessageReply {
 pub struct ChatSummary {
     pub id: i64,
     pub title: String,
+    pub last_message_id: Option<i64>,
     pub last_message_preview: String,
     pub unread_count: u32,
     pub position: i64,

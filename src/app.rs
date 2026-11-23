@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domain::{
-        AuthorizationState, BackendEvent, ChatMessage, ChatSummary, MessagePreview, MessageReply,
+        AuthorizationState, BackendEvent, ChatMessage, ChatSummary, DeleteScope, MessageAction,
+        MessageActions, MessageAddress, MessagePreview, MessageReply,
     },
     tg::{Adapter, AdapterCommandError},
 };
@@ -46,6 +47,11 @@ pub(crate) struct State {
     next_temporary_message_id: i64,
     send_error: Option<String>,
     message_menu: Option<MessageMenu>,
+    edit: Option<EditSession>,
+    delete_confirmation: Option<DeleteConfirmation>,
+    pending_mutation: Option<PendingMutation>,
+    next_action_request_id: u64,
+    message_action_error: Option<String>,
     reply_to: Option<i64>,
     reply_lookup_pending: bool,
     forward_selection: Option<ForwardSelection>,
@@ -58,6 +64,24 @@ pub(crate) struct State {
 pub(crate) struct MessageMenu {
     pub message_id: i64,
     pub position: Point,
+    pub actions: MessageActions,
+    pub request_id: Option<u64>,
+}
+
+struct PendingMutation {
+    request_id: u64,
+    address: MessageAddress,
+}
+
+struct EditSession {
+    message_id: i64,
+    draft: text_editor::Content,
+}
+
+/// A message selected for deletion and the available scopes.
+pub(crate) struct DeleteConfirmation {
+    pub message_id: i64,
+    pub actions: MessageActions,
 }
 
 /// The selected source message and optional destination of a forward.
@@ -97,6 +121,16 @@ pub(crate) enum Message {
         position: Point,
     },
     DismissMessageMenu,
+    Escape,
+    StartEdit(i64),
+    CancelEdit,
+    ShowDeleteConfirmation(i64),
+    ConfirmDelete(DeleteScope),
+    CancelDelete,
+    ActionQueued {
+        request_id: u64,
+        result: Result<(), AdapterCommandError>,
+    },
     SelectReply(i64),
     CancelReply,
     ReplyLookupQueued(Result<(), AdapterCommandError>),
@@ -138,6 +172,11 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
         next_temporary_message_id: -1,
         send_error: None,
         message_menu: None,
+        edit: None,
+        delete_confirmation: None,
+        pending_mutation: None,
+        next_action_request_id: 0,
+        message_action_error: None,
         reply_to: None,
         reply_lookup_pending: false,
         forward_selection: None,
@@ -154,7 +193,7 @@ pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
 /// Subscribes the application to backend events.
 pub(crate) fn subscription(state: &State) -> Subscription<Message> {
     let backend = state.backend.subscription().map(Message::BackendEvent);
-    if state.message_menu.is_some() {
+    if state.message_menu.is_some() || state.edit.is_some() || state.delete_confirmation.is_some() {
         Subscription::batch([backend, event::listen_with(message_menu_event)])
     } else {
         backend
@@ -166,7 +205,7 @@ fn message_menu_event(event: Event, status: event::Status, _: window::Id) -> Opt
         Event::Keyboard(keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(Named::Escape),
             ..
-        }) => Some(Message::DismissMessageMenu),
+        }) => Some(Message::Escape),
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
             if status == event::Status::Ignored =>
         {
@@ -191,6 +230,10 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.chats.clear();
                 state.open_chat_id = None;
                 state.message_menu = None;
+                state.edit = None;
+                state.delete_confirmation = None;
+                state.pending_mutation = None;
+                state.message_action_error = None;
                 state.messages.clear();
                 state.has_older_messages = false;
                 state.loading_older_messages = false;
@@ -333,6 +376,82 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.send_error = Some(reason);
             }
         }
+        Message::BackendEvent(BackendEvent::MessageActionsLoaded { request_id, result }) => {
+            apply_message_actions(state, request_id, result);
+        }
+        Message::BackendEvent(BackendEvent::MessageMutationFinished { request_id, result }) => {
+            finish_message_mutation(state, request_id, result);
+        }
+        Message::BackendEvent(BackendEvent::MessageContentChanged {
+            address,
+            text,
+            is_text,
+        }) => {
+            if let Some(chat) = state.chats.iter_mut().find(|chat| {
+                chat.id == address.chat_id && chat.last_message_id == Some(address.message_id)
+            }) {
+                chat.last_message_preview.clone_from(&text);
+            }
+            apply_message_content(
+                &mut state.messages,
+                state.open_chat_id,
+                address,
+                text,
+                is_text,
+            );
+        }
+        Message::BackendEvent(BackendEvent::MessageEdited(address)) => {
+            if state.open_chat_id == Some(address.chat_id)
+                && let Some(message) = state
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == address.message_id)
+            {
+                message.is_edited = true;
+            }
+        }
+        Message::BackendEvent(BackendEvent::MessagesDeleted {
+            chat_id,
+            mut message_ids,
+        }) => {
+            message_ids.sort_unstable();
+            let deleted = |id: i64| message_ids.binary_search(&id).is_ok();
+            apply_message_deletion(&mut state.messages, state.open_chat_id, chat_id, deleted);
+            if state.open_chat_id == Some(chat_id) {
+                if state
+                    .message_menu
+                    .is_some_and(|menu| deleted(menu.message_id))
+                {
+                    state.message_menu = None;
+                }
+                if state.reply_to.is_some_and(deleted) {
+                    state.reply_to = None;
+                }
+                if state
+                    .edit
+                    .as_ref()
+                    .is_some_and(|edit| deleted(edit.message_id))
+                {
+                    restore_composer(state);
+                    state.message_action_error = None;
+                }
+                if state
+                    .delete_confirmation
+                    .as_ref()
+                    .is_some_and(|confirmation| deleted(confirmation.message_id))
+                {
+                    state.delete_confirmation = None;
+                    state.message_action_error = None;
+                }
+                if state
+                    .forward_selection
+                    .as_ref()
+                    .is_some_and(|selection| deleted(selection.message_id))
+                {
+                    state.forward_selection = None;
+                }
+            }
+        }
         Message::BackendEvent(BackendEvent::ReplyPreviewsLoaded { chat_id, previews }) => {
             state.reply_lookup_pending = false;
             if state.open_chat_id == Some(chat_id) {
@@ -424,6 +543,9 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.message_menu = None;
             if state.open_chat_id != Some(chat_id) {
                 state.open_chat_id = Some(chat_id);
+                state.edit = None;
+                state.delete_confirmation = None;
+                state.message_action_error = None;
                 state.reply_to = None;
                 state.forward_selection = None;
                 state.forward_status = None;
@@ -505,8 +627,15 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::ComposerAction(action) => {
-            state.composer.perform(action);
-            state.send_error = None;
+            if state.delete_confirmation.is_none()
+                && !(state.edit.is_some() && state.mutation_pending())
+            {
+                state.composer.perform(action);
+                state.send_error = None;
+                if state.edit.is_some() {
+                    state.message_action_error = None;
+                }
+            }
         }
         Message::OpenMessageMenu {
             chat_id,
@@ -514,18 +643,117 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             position,
         } => {
             if state.open_chat_id == Some(chat_id)
-                && state.referenceable_message(message_id).is_some()
+                && state.delete_confirmation.is_none()
+                && let Some(message) = state.referenceable_message(message_id)
             {
+                let request_id =
+                    (message.is_outgoing && state.edit.is_none() && !state.mutation_pending())
+                        .then(|| state.action_request_id());
+                if request_id.is_some() {
+                    state.message_action_error = None;
+                }
                 state.message_menu = Some(MessageMenu {
                     message_id,
                     position,
+                    actions: MessageActions::default(),
+                    request_id,
                 });
+                if let Some(request_id) = request_id {
+                    return request_message_action(
+                        state,
+                        request_id,
+                        MessageAddress {
+                            chat_id,
+                            message_id,
+                        },
+                        MessageAction::Inspect,
+                    );
+                }
             }
         }
         Message::DismissMessageMenu => state.message_menu = None,
+        Message::Escape => {
+            if state.message_menu.take().is_none()
+                && (state.delete_confirmation.take().is_some() || !state.mutation_pending())
+            {
+                restore_composer(state);
+                state.message_action_error = None;
+            }
+        }
+        Message::StartEdit(message_id) => {
+            let actions = take_menu_actions(state, message_id);
+            if actions.can_edit
+                && !state.mutation_pending()
+                && state.edit.is_none()
+                && let Some(message) = state.referenceable_message(message_id)
+                && message.is_outgoing
+                && message.is_text
+            {
+                let edit_content = text_editor::Content::with_text(&message.text);
+                state.edit = Some(EditSession {
+                    message_id,
+                    draft: std::mem::replace(&mut state.composer, edit_content),
+                });
+                state.message_action_error = None;
+                return iced::widget::operation::focus(CHAT_COMPOSER_ID);
+            }
+        }
+        Message::CancelEdit => {
+            if !state.mutation_pending() && state.edit.is_some() {
+                restore_composer(state);
+                state.message_action_error = None;
+                return iced::widget::operation::focus(CHAT_COMPOSER_ID);
+            }
+        }
+        Message::ShowDeleteConfirmation(message_id) => {
+            let actions = take_menu_actions(state, message_id);
+            if (actions.can_delete_for_self || actions.can_delete_for_everyone)
+                && state.edit.is_none()
+                && !state.mutation_pending()
+                && state
+                    .referenceable_message(message_id)
+                    .is_some_and(|message| message.is_outgoing)
+            {
+                state.delete_confirmation = Some(DeleteConfirmation {
+                    message_id,
+                    actions,
+                });
+                state.message_action_error = None;
+            }
+        }
+        Message::ConfirmDelete(scope) => {
+            if !state.mutation_pending()
+                && let Some(chat_id) = state.open_chat_id
+                && let Some(confirmation) = &state.delete_confirmation
+                && confirmation.permits(scope)
+            {
+                let address = MessageAddress {
+                    chat_id,
+                    message_id: confirmation.message_id,
+                };
+                return start_message_mutation(state, address, MessageAction::Delete(scope));
+            }
+        }
+        Message::CancelDelete => {
+            state.delete_confirmation = None;
+            state.message_action_error = None;
+        }
+        Message::ActionQueued { request_id, result } => {
+            if let Err(error) = result {
+                if state
+                    .pending_mutation
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    finish_message_mutation(state, request_id, Err(error.to_string()));
+                } else {
+                    apply_message_actions(state, request_id, Err(error.to_string()));
+                }
+            }
+        }
         Message::SelectReply(message_id) => {
             state.message_menu = None;
-            if state.referenceable_message(message_id).is_some() {
+            if state.edit.is_none() && state.referenceable_message(message_id).is_some() {
                 state.reply_to = Some(message_id);
                 return iced::widget::operation::focus(CHAT_COMPOSER_ID);
             }
@@ -596,12 +824,34 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Submit => {
+            if state.delete_confirmation.is_some() {
+                return Task::none();
+            }
             let Some(chat_id) = state.open_chat_id else {
                 return Task::none();
             };
             let text = state.composer.text();
             if text.trim().is_empty() {
                 return Task::none();
+            }
+            if let Some(edit) = &state.edit {
+                if state.mutation_pending() {
+                    return Task::none();
+                }
+                let Some(original) = state.referenceable_message(edit.message_id) else {
+                    restore_composer(state);
+                    return Task::none();
+                };
+                if text == original.text {
+                    restore_composer(state);
+                    state.message_action_error = None;
+                    return Task::none();
+                }
+                let address = MessageAddress {
+                    chat_id,
+                    message_id: edit.message_id,
+                };
+                return start_message_mutation(state, address, MessageAction::Edit(text));
             }
             let reply = state.reply_message().map(|original| {
                 Box::new(MessageReply {
@@ -627,6 +877,8 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                     text: text.clone(),
                     is_outgoing: true,
                     can_reference: false,
+                    is_text: true,
+                    is_edited: false,
                     reply,
                     forwarded_from: None,
                 },
@@ -668,6 +920,182 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::AuthorizationCommandSent(Ok(())) => {}
     }
     Task::none()
+}
+
+fn request_message_action(
+    state: &State,
+    request_id: u64,
+    address: MessageAddress,
+    action: MessageAction,
+) -> Task<Message> {
+    let backend = state.backend.clone();
+    Task::perform(
+        async move { backend.message_action(address, request_id, action).await },
+        move |result| Message::ActionQueued { request_id, result },
+    )
+}
+
+fn start_message_mutation(
+    state: &mut State,
+    address: MessageAddress,
+    action: MessageAction,
+) -> Task<Message> {
+    let request_id = state.action_request_id();
+    state.pending_mutation = Some(PendingMutation {
+        request_id,
+        address,
+    });
+    state.message_action_error = None;
+    request_message_action(state, request_id, address, action)
+}
+
+fn finish_message_mutation(state: &mut State, request_id: u64, result: Result<(), String>) {
+    let Some(pending) = state
+        .pending_mutation
+        .as_ref()
+        .filter(|pending| pending.request_id == request_id)
+    else {
+        return;
+    };
+    let address = pending.address;
+    state.pending_mutation = None;
+    if state.open_chat_id != Some(address.chat_id)
+        || state.referenceable_message(address.message_id).is_none()
+    {
+        return;
+    }
+    match result {
+        Ok(()) => {
+            state.delete_confirmation = None;
+            restore_composer(state);
+            state.message_action_error = None;
+        }
+        Err(error) => state.message_action_error = Some(error),
+    }
+}
+
+fn restore_composer(state: &mut State) {
+    if let Some(edit) = state.edit.take() {
+        state.composer = edit.draft;
+    }
+}
+
+fn apply_message_actions(
+    state: &mut State,
+    request_id: u64,
+    result: Result<MessageActions, String>,
+) {
+    let Some(menu) = state
+        .message_menu
+        .filter(|menu| menu.request_id == Some(request_id))
+    else {
+        return;
+    };
+    let mut actions = match result {
+        Ok(actions) => actions,
+        Err(error) => {
+            state.message_action_error = Some(error);
+            MessageActions::default()
+        }
+    };
+    actions.can_edit &= state
+        .referenceable_message(menu.message_id)
+        .is_some_and(|message| message.is_text);
+    state.message_menu = Some(MessageMenu {
+        actions,
+        request_id: None,
+        ..menu
+    });
+}
+
+fn take_menu_actions(state: &mut State, message_id: i64) -> MessageActions {
+    state
+        .message_menu
+        .take()
+        .filter(|menu| menu.message_id == message_id)
+        .map_or_else(MessageActions::default, |menu| menu.actions)
+}
+
+fn apply_message_content(
+    messages: &mut [ChatMessage],
+    open_chat_id: Option<i64>,
+    address: MessageAddress,
+    text: String,
+    is_text: bool,
+) {
+    let original_index = (open_chat_id == Some(address.chat_id))
+        .then(|| {
+            messages
+                .iter()
+                .position(|message| message.id == address.message_id)
+        })
+        .flatten();
+    let snippet = messages
+        .iter()
+        .any(|message| {
+            message.reply.as_ref().is_some_and(|reply| {
+                reply.chat_id == address.chat_id
+                    && reply.message_id == address.message_id
+                    && reply.quote.is_none()
+            })
+        })
+        .then(|| MessagePreview::snippet(&text));
+
+    if let Some(snippet) = snippet {
+        let sender =
+            original_index.map(|index| MessagePreview::snippet(&messages[index].sender_name));
+        for reply in messages
+            .iter_mut()
+            .filter_map(|message| message.reply.as_mut())
+            .filter(|reply| {
+                reply.chat_id == address.chat_id
+                    && reply.message_id == address.message_id
+                    && reply.quote.is_none()
+            })
+        {
+            let sender_name = reply
+                .preview
+                .take()
+                .and_then(|preview| preview.sender_name)
+                .or_else(|| sender.clone());
+            reply.resolve(Some(MessagePreview {
+                sender_name,
+                text: snippet.clone(),
+            }));
+        }
+    }
+    if let Some(index) = original_index {
+        messages[index].text = text;
+        messages[index].is_text = is_text;
+    }
+}
+
+fn apply_message_deletion(
+    messages: &mut Vec<ChatMessage>,
+    open_chat_id: Option<i64>,
+    chat_id: i64,
+    deleted: impl Fn(i64) -> bool,
+) {
+    if open_chat_id == Some(chat_id) {
+        messages.retain(|message| !deleted(message.id));
+    }
+    for reply in messages
+        .iter_mut()
+        .filter_map(|message| message.reply.as_mut())
+    {
+        if reply.chat_id == chat_id && deleted(reply.message_id) {
+            reply.resolve(None);
+        }
+    }
+}
+
+impl DeleteConfirmation {
+    fn permits(&self, scope: DeleteScope) -> bool {
+        match scope {
+            DeleteScope::ForSelf => self.actions.can_delete_for_self,
+            DeleteScope::ForEveryone => self.actions.can_delete_for_everyone,
+        }
+    }
 }
 
 fn refresh_reply_previews(state: &mut State) -> Task<Message> {
@@ -744,7 +1172,7 @@ fn apply_reply_previews(
 }
 
 fn restore_rejected_message(state: &mut State, message_id: i64, text: &str) {
-    if state.composer.text().is_empty() && state.reply_to.is_none() {
+    if state.edit.is_none() && state.composer.text().is_empty() && state.reply_to.is_none() {
         state.reply_to = state
             .messages
             .iter()
@@ -826,6 +1254,22 @@ impl State {
             .iter()
             .find(|message| message.id == message_id && message.can_reference)
     }
+    fn action_request_id(&mut self) -> u64 {
+        self.next_action_request_id = self.next_action_request_id.wrapping_add(1);
+        self.next_action_request_id
+    }
+    pub(crate) fn is_editing(&self) -> bool {
+        self.edit.is_some()
+    }
+    pub(crate) fn mutation_pending(&self) -> bool {
+        self.pending_mutation.is_some()
+    }
+    pub(crate) fn delete_confirmation(&self) -> Option<&DeleteConfirmation> {
+        self.delete_confirmation.as_ref()
+    }
+    pub(crate) fn message_action_error(&self) -> Option<&str> {
+        self.message_action_error.as_deref()
+    }
     pub(crate) fn message_menu(&self) -> Option<MessageMenu> {
         self.message_menu
             .filter(|menu| self.referenceable_message(menu.message_id).is_some())
@@ -875,6 +1319,8 @@ mod tests {
             text: "first line\nsecond line".into(),
             is_outgoing: false,
             can_reference: true,
+            is_text: true,
+            is_edited: false,
             reply: None,
             forwarded_from: None,
         }
@@ -927,18 +1373,148 @@ mod tests {
 
         apply_reply_previews(&mut messages, [(2, None), (3, None)]);
 
-        let snippet = |index: usize| {
-            messages[index]
-                .reply
-                .as_ref()
-                .unwrap()
-                .preview
-                .as_ref()
-                .unwrap()
-                .text
-                .as_ref()
-        };
+        let snippet = |index: usize| messages[index].reply.as_ref().unwrap().display_text();
         assert_eq!(snippet(0), "selected quote");
         assert_eq!(snippet(1), "Original message unavailable");
+    }
+
+    #[test]
+    fn edit_updates_original_and_live_preview_but_preserves_quote() {
+        let mut messages = [
+            message(1),
+            reply(2, 10, 1),
+            reply(3, 10, 1),
+            reply(4, 20, 1),
+        ];
+        messages[2].reply.as_mut().unwrap().quote = Some("original quote".into());
+        collect_reply_lookups(&mut messages, 10, false);
+
+        apply_message_content(
+            &mut messages,
+            Some(10),
+            MessageAddress {
+                chat_id: 10,
+                message_id: 1,
+            },
+            "updated text".into(),
+            true,
+        );
+
+        assert_eq!(messages[0].text, "updated text");
+        assert_eq!(
+            messages[1].reply.as_ref().unwrap().display_text(),
+            "updated text"
+        );
+        assert_eq!(
+            messages[2].reply.as_ref().unwrap().display_text(),
+            "original quote"
+        );
+        assert!(messages[3].reply.as_ref().unwrap().preview.is_none());
+    }
+
+    #[test]
+    fn deletion_updates_only_the_target_rows_and_reply_references() {
+        let mut messages = vec![message(1), reply(2, 20, 1), reply(3, 10, 1)];
+        apply_message_deletion(&mut messages, Some(10), 20, |id| id == 1);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[1].reply.as_ref().unwrap().display_text(),
+            "Original message unavailable"
+        );
+        assert!(messages[2].reply.as_ref().unwrap().preview.is_none());
+
+        apply_message_deletion(&mut messages, Some(10), 10, |id| id == 1);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(
+            messages[1].reply.as_ref().unwrap().display_text(),
+            "Original message unavailable"
+        );
+    }
+
+    fn conversation_with_own_message(actions: MessageActions) -> State {
+        let (mut state, _) = boot(Adapter::for_tests());
+        state.open_chat_id = Some(10);
+        let mut own = message(1);
+        own.is_outgoing = true;
+        state.messages.push(own);
+        let _ = update(
+            &mut state,
+            Message::OpenMessageMenu {
+                chat_id: 10,
+                message_id: 1,
+                position: Point::ORIGIN,
+            },
+        );
+        let request_id = state.message_menu().unwrap().request_id.unwrap();
+        let _ = update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::MessageActionsLoaded {
+                request_id,
+                result: Ok(actions),
+            }),
+        );
+        state
+    }
+
+    #[test]
+    fn rejected_edit_keeps_its_text_and_cancel_restores_the_draft() {
+        let mut state = conversation_with_own_message(MessageActions {
+            can_edit: true,
+            ..MessageActions::default()
+        });
+        state.composer = text_editor::Content::with_text("unsent draft");
+        let _ = update(&mut state, Message::StartEdit(1));
+        assert_eq!(state.composer.text(), state.messages[0].text);
+
+        state.composer = text_editor::Content::with_text("edited text");
+        let _ = update(&mut state, Message::Submit);
+        let request_id = state.pending_mutation.as_ref().unwrap().request_id;
+        let _ = update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::MessageMutationFinished {
+                request_id,
+                result: Err("edit rejected".into()),
+            }),
+        );
+        assert_eq!(state.composer.text(), "edited text");
+        assert_eq!(state.message_action_error(), Some("edit rejected"));
+
+        let _ = update(&mut state, Message::CancelEdit);
+        assert_eq!(state.composer.text(), "unsent draft");
+        assert!(!state.is_editing());
+    }
+
+    #[test]
+    fn deletion_requires_confirmation_for_a_permitted_scope() {
+        let mut state = conversation_with_own_message(MessageActions {
+            can_delete_for_self: true,
+            ..MessageActions::default()
+        });
+        let _ = update(&mut state, Message::ConfirmDelete(DeleteScope::ForSelf));
+        assert!(!state.mutation_pending());
+
+        let _ = update(&mut state, Message::ShowDeleteConfirmation(1));
+        assert!(state.delete_confirmation().is_some());
+        let _ = update(&mut state, Message::ConfirmDelete(DeleteScope::ForEveryone));
+        assert!(!state.mutation_pending());
+        let _ = update(&mut state, Message::ConfirmDelete(DeleteScope::ForSelf));
+        assert!(state.mutation_pending());
+        assert_eq!(state.messages.len(), 1);
+
+        let _ = update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::MessagesDeleted {
+                chat_id: 10,
+                message_ids: vec![1],
+            }),
+        );
+        assert!(state.messages.is_empty());
+        assert!(state.delete_confirmation().is_none());
     }
 }

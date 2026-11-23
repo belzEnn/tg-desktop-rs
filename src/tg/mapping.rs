@@ -8,7 +8,10 @@ use tdlib_rs::{
     types::Chat,
 };
 
-use crate::domain::{AuthorizationState, ChatMessage, ChatSummary, MessagePreview, MessageReply};
+use crate::domain::{
+    AuthorizationState, BackendEvent, ChatMessage, ChatSummary, MessageActions, MessageAddress,
+    MessagePreview, MessageReply,
+};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(super) enum MessageSenderReference {
@@ -25,6 +28,7 @@ pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
     Some(ChatSummary {
         id: chat.id,
         title: chat.title.clone(),
+        last_message_id: chat.last_message.as_ref().map(|message| message.id),
         last_message_preview: chat.last_message.as_ref().map_or_else(
             || "No messages yet".into(),
             |message| match &message.content {
@@ -69,14 +73,17 @@ pub(super) fn input_reply(message_id: i64) -> tdlib_rs::enums::InputMessageReply
     })
 }
 
-pub(super) fn input_text_content(text: String) -> tdlib_rs::enums::InputMessageContent {
+pub(super) fn input_text_content(
+    text: String,
+    clear_draft: bool,
+) -> tdlib_rs::enums::InputMessageContent {
     tdlib_rs::enums::InputMessageContent::InputMessageText(tdlib_rs::types::InputMessageText {
         text: tdlib_rs::types::FormattedText {
             text,
             entities: Vec::new(),
         },
         link_preview_options: None,
-        clear_draft: true,
+        clear_draft,
     })
 }
 
@@ -123,10 +130,7 @@ pub(super) fn chat_message(
         };
         MessagePreview::snippet(name)
     });
-    let text = match message.content {
-        MessageContent::MessageText(text) => text.text.text,
-        _ => "Unsupported message".into(),
-    };
+    let (text, is_text) = display_content(message.content);
     ChatMessage {
         id: message.id,
         date: message.date,
@@ -134,8 +138,55 @@ pub(super) fn chat_message(
         text,
         is_outgoing: message.is_outgoing,
         can_reference: message.sending_state.is_none(),
+        is_text,
+        is_edited: message.edit_date > 0,
         reply,
         forwarded_from,
+    }
+}
+
+fn display_content(content: MessageContent) -> (String, bool) {
+    match content {
+        MessageContent::MessageText(text) => (text.text.text, true),
+        _ => ("Unsupported message".into(), false),
+    }
+}
+
+pub(super) fn message_actions(properties: tdlib_rs::enums::MessageProperties) -> MessageActions {
+    let tdlib_rs::enums::MessageProperties::MessageProperties(properties) = properties;
+    MessageActions {
+        can_edit: properties.can_be_edited,
+        can_delete_for_self: properties.can_be_deleted_only_for_self,
+        can_delete_for_everyone: properties.can_be_deleted_for_all_users,
+    }
+}
+
+pub(super) fn message_change(update: Update) -> Option<BackendEvent> {
+    match update {
+        Update::MessageContent(update) => {
+            let (text, is_text) = display_content(update.new_content);
+            Some(BackendEvent::MessageContentChanged {
+                address: MessageAddress {
+                    chat_id: update.chat_id,
+                    message_id: update.message_id,
+                },
+                text,
+                is_text,
+            })
+        }
+        Update::MessageEdited(update) if update.edit_date > 0 => {
+            Some(BackendEvent::MessageEdited(MessageAddress {
+                chat_id: update.chat_id,
+                message_id: update.message_id,
+            }))
+        }
+        Update::DeleteMessages(update) if !update.from_cache => {
+            Some(BackendEvent::MessagesDeleted {
+                chat_id: update.chat_id,
+                message_ids: update.message_ids,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -228,5 +279,32 @@ pub(super) fn authorization_error(message: String) -> String {
         "PASSWORD_HASH_INVALID" => "The 2FA password is incorrect. Try again.".into(),
         "FLOOD_WAIT" | "FLOOD" => "Too many attempts. Wait a while and try again.".into(),
         _ => "Telegram couldn't complete sign-in. Check your details and try again.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tdlib_rs::types::UpdateDeleteMessages;
+
+    #[test]
+    fn cache_eviction_is_not_a_message_deletion() {
+        let update = UpdateDeleteMessages {
+            chat_id: 10,
+            message_ids: vec![2],
+            is_permanent: false,
+            from_cache: true,
+        };
+        assert!(message_change(Update::DeleteMessages(update.clone())).is_none());
+        assert_eq!(
+            message_change(Update::DeleteMessages(UpdateDeleteMessages {
+                from_cache: false,
+                ..update
+            })),
+            Some(BackendEvent::MessagesDeleted {
+                chat_id: 10,
+                message_ids: vec![2]
+            }),
+        );
     }
 }

@@ -122,3 +122,15 @@ RSS after login, after opening a 50-message chat, and after one idle hour
 remains pending, along with reply-preview latency and an end-to-end forwarding
 check. This environment could not start the GUI on Wayland or bind an Xvfb
 display, so no authenticated Telegram test-DC session was exercised.
+
+## Phase 6.2 — edit and delete messages
+
+Opening an outgoing message's menu requests its properties once. It adds no
+per-message permission cache or history fetch. Mutations run off the backend
+command loop, with one mutation tracked by the UI at a time. Editing holds
+one existing draft while reusing the composer. Live changes update the loaded
+rows and related previews in place.
+
+RSS after login, after opening a 50-message chat, and after one idle hour
+remains pending, along with edit and delete latency and an end-to-end check
+against Telegram's test DC.
