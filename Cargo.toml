@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "=1.0.100"
 dirs = "=7.0.0"
 dotenvy = "=0.15.7"
-iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "x11", "wayland"] }
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "tiny-skia", "thread-pool", "x11", "wayland"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.17"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }

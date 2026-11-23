@@ -98,8 +98,9 @@ measurements.
 
 ## 6. Message essentials
 
-- **6.1 Replies and forwarding.** ☐ Reply preview in rows; forward to another
-  chat.
+- **6.1 Replies and forwarding.** 🚧 Reply previews and reply composition.
+  Right-click a message to reply or forward it to another chat. Test-DC
+  verification and RSS measurements pending.
 - **6.2 Edit and delete.** ☐ Own messages: edit and delete; live refresh from
   edit and delete updates.
 - **6.3 Mark as read.** ☐ Mark messages read when viewed; unread counters stay

@@ -109,3 +109,16 @@ is retained only for the selected chat and cleared when another chat is opened;
 there is no separate history cache. Memory use can therefore grow with the
 number of pages visited in the active chat. RSS measurements after login,
 opening a chat, and one idle hour remain pending with a Telegram test account.
+
+## Phase 6.1 — replies and forwarding
+
+Reply previews reuse open history before querying TDLib. Each preview field
+is limited to 100 Unicode characters plus an ellipsis. At most four original
+messages are fetched concurrently, and the first history page renders before
+these lookups finish. The UI releases saved previews when the chat changes.
+The destination picker reuses the bounded main chat list.
+
+RSS after login, after opening a 50-message chat, and after one idle hour
+remains pending, along with reply-preview latency and an end-to-end forwarding
+check. This environment could not start the GUI on Wayland or bind an Xvfb
+display, so no authenticated Telegram test-DC session was exercised.

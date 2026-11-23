@@ -14,7 +14,10 @@ use std::{
 
 use iced::{Subscription, futures::SinkExt, stream};
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinSet,
+};
 use tracing::{error, info, warn};
 
 use crate::domain::{AuthorizationState, BackendEvent, ChatMessage};
@@ -28,6 +31,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHAT_LIST_LIMIT: i32 = 50;
 const CHAT_HISTORY_LIMIT: usize = 50;
+const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Errors raised while starting the TDLib adapter.
 #[derive(Debug, Error)]
@@ -67,6 +71,16 @@ enum BackendCommand {
         chat_id: i64,
         message_id: i64,
         text: String,
+        reply_to: Option<i64>,
+    },
+    ResolveReplies {
+        chat_id: i64,
+        message_ids: Vec<i64>,
+    },
+    Forward {
+        from_chat_id: i64,
+        message_id: i64,
+        to_chat_id: i64,
     },
 }
 
@@ -188,14 +202,12 @@ impl Adapter {
 
     /// Sends a phone number to TDLib without exposing backend types to the app.
     pub(crate) async fn submit_phone(&self, phone: String) -> Result<(), AdapterCommandError> {
-        self.send_authorization_command(BackendCommand::SubmitPhone(phone))
-            .await
+        self.send_command(BackendCommand::SubmitPhone(phone)).await
     }
 
     /// Sends a login code to TDLib without exposing backend types to the app.
     pub(crate) async fn submit_code(&self, code: String) -> Result<(), AdapterCommandError> {
-        self.send_authorization_command(BackendCommand::SubmitCode(code))
-            .await
+        self.send_command(BackendCommand::SubmitCode(code)).await
     }
 
     /// Sends a 2FA password to TDLib without exposing backend types to the app.
@@ -203,7 +215,7 @@ impl Adapter {
         &self,
         password: String,
     ) -> Result<(), AdapterCommandError> {
-        self.send_authorization_command(BackendCommand::SubmitPassword(password))
+        self.send_command(BackendCommand::SubmitPassword(password))
             .await
     }
 
@@ -230,27 +242,52 @@ impl Adapter {
             .map_err(|_| AdapterCommandError::WorkerStopped)
     }
 
-    /// Sends plain text to a chat through TDLib.
+    /// Sends text with an optional reply to a message in the same chat.
     pub(crate) async fn send_text(
         &self,
         chat_id: i64,
         message_id: i64,
         text: String,
+        reply_to: Option<i64>,
     ) -> Result<(), AdapterCommandError> {
-        self.commands
-            .send(BackendCommand::SendText {
-                chat_id,
-                message_id,
-                text,
-            })
-            .await
-            .map_err(|_| AdapterCommandError::WorkerStopped)
+        self.send_command(BackendCommand::SendText {
+            chat_id,
+            message_id,
+            text,
+            reply_to,
+        })
+        .await
     }
 
-    async fn send_authorization_command(
+    /// Resolves the original messages for a bounded batch of reply rows.
+    pub(crate) async fn resolve_replies(
         &self,
-        command: BackendCommand,
+        chat_id: i64,
+        message_ids: Vec<i64>,
     ) -> Result<(), AdapterCommandError> {
+        self.send_command(BackendCommand::ResolveReplies {
+            chat_id,
+            message_ids,
+        })
+        .await
+    }
+
+    /// Asks Telegram to forward one message with its attribution intact.
+    pub(crate) async fn forward(
+        &self,
+        from_chat_id: i64,
+        message_id: i64,
+        to_chat_id: i64,
+    ) -> Result<(), AdapterCommandError> {
+        self.send_command(BackendCommand::Forward {
+            from_chat_id,
+            message_id,
+            to_chat_id,
+        })
+        .await
+    }
+
+    async fn send_command(&self, command: BackendCommand) -> Result<(), AdapterCommandError> {
         self.commands
             .send(command)
             .await
@@ -318,8 +355,17 @@ async fn run_supervisor(
     let mut client_closed = false;
     let mut main_chats_loaded = false;
     let mut pending_message_ids = HashMap::new();
+    let mut pending_forward = None;
+    let mut reply_lookups = JoinSet::new();
     loop {
         tokio::select! {
+            Some(result) = reply_lookups.join_next(), if !reply_lookups.is_empty() => {
+                if let Ok(event) = result
+                    && events.send(event).await.is_err()
+                {
+                    break;
+                }
+            }
             command = commands.recv() => match command {
                 Some(BackendCommand::Initialize) => {
                     if client_closed {
@@ -463,13 +509,13 @@ async fn run_supervisor(
                         }
                     }
                 }
-                Some(BackendCommand::SendText { chat_id, message_id, text }) => {
+                Some(BackendCommand::SendText { chat_id, message_id, text, reply_to }) => {
                     let content = mapping::input_text_content(text.clone());
                     match tdlib_rs::functions::send_message(
-                        chat_id, None, None, None, content, client_id,
+                        chat_id, None, reply_to.map(mapping::input_reply), None, content, client_id,
                     ).await {
                         Ok(tdlib_rs::enums::Message::Message(message)) => {
-                            pending_message_ids.insert(message.id, (chat_id, message_id, text));
+                            pending_message_ids.insert((chat_id, message.id), (message_id, text));
                         }
                         Err(error) => {
                             warn!(code = error.code, "Telegram rejected a text message");
@@ -482,6 +528,25 @@ async fn run_supervisor(
                         }
                     }
                 }
+                Some(BackendCommand::ResolveReplies { chat_id, message_ids }) => {
+                    reply_lookups.spawn(resolve_replies(chat_id, message_ids, client_id));
+                }
+                Some(BackendCommand::Forward { from_chat_id, message_id, to_chat_id }) => {
+                    match forward_message(from_chat_id, message_id, to_chat_id, client_id).await {
+                        Ok(message) if matches!(message.sending_state, Some(tdlib_rs::enums::MessageSendingState::Pending(_))) => {
+                            pending_forward = Some((to_chat_id, message.id));
+                        }
+                        Ok(message) if message.sending_state.is_none() => {
+                            let message = map_message(message, client_id).await;
+                            let _ = events.send(BackendEvent::NewMessage { chat_id: to_chat_id, message }).await;
+                            let _ = events.send(BackendEvent::ForwardFinished { result: Ok(()), discarded_message: None }).await;
+                        }
+                        result => {
+                            let reason = result.err().unwrap_or("Telegram couldn't forward the message.");
+                            let _ = events.send(BackendEvent::ForwardFinished { result: Err(reason.into()), discarded_message: None }).await;
+                        }
+                    }
+                }
                 None => break,
             },
             update = updates.recv() => match update {
@@ -490,6 +555,8 @@ async fn run_supervisor(
                         if state == AuthorizationState::Closed {
                             client_closed = true;
                             main_chats_loaded = false;
+                            pending_message_ids.clear();
+                            pending_forward = None;
                         }
                         if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                             break;
@@ -546,47 +613,55 @@ async fn run_supervisor(
                             ),
                         }
                     }
-                    if let Some(sender) = mapping::new_message_sender(&update) {
-                        let sender_name = resolve_sender_name(sender, client_id).await;
-                        let message_id = mapping::new_message_id(&update)
-                            .and_then(|id| pending_message_ids.get(&id).map(|(_, id, _)| *id));
-                        if let Some((chat_id, message)) =
-                            mapping::new_message(&update, sender_name, message_id)
-                            && events.send(BackendEvent::NewMessage { chat_id, message }).await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    if let Some(sender) = mapping::successful_message_sender(&update) {
-                        let sender_name = resolve_sender_name(sender, client_id).await;
-                        let client_message_id = mapping::successful_message_id(&update)
-                            .and_then(|id| pending_message_ids.remove(&id).map(|(_, id, _)| id));
-                        if let Some((chat_id, _, message)) =
-                            mapping::message_send_succeeded(&update, sender_name, client_message_id)
-                        {
-                            if let Some(client_message_id) = client_message_id {
-                                if events.send(BackendEvent::MessageSendSucceeded {
-                                    chat_id,
-                                    old_message_id: client_message_id,
-                                    message,
-                                }).await.is_err() {
-                                    break;
-                                }
-                            } else if events.send(BackendEvent::NewMessage { chat_id, message }).await.is_err() {
+                    match update {
+                        tdlib_rs::enums::Update::NewMessage(update) => {
+                            let chat_id = update.message.chat_id;
+                            let mut message = map_message(update.message, client_id).await;
+                            if let Some((id, _)) = pending_message_ids.get(&(chat_id, message.id)) {
+                                message.id = *id;
+                            }
+                            if events.send(BackendEvent::NewMessage { chat_id, message }).await.is_err() {
                                 break;
                             }
                         }
-                    }
-                    if let Some((chat_id, tdlib_message_id)) = mapping::message_send_failed(&update)
-                        && let Some((_, client_message_id, text)) = pending_message_ids.remove(&tdlib_message_id)
-                        && events.send(BackendEvent::MessageSendRejected {
-                            chat_id,
-                            message_id: client_message_id,
-                            text,
-                            reason: "Telegram couldn't send the message.".into(),
-                        }).await.is_err() {
-                        break;
+                        tdlib_rs::enums::Update::MessageSendSucceeded(update) => {
+                            let chat_id = update.message.chat_id;
+                            let old_message_id = update.old_message_id;
+                            let key = (chat_id, old_message_id);
+                            let local_message_id = pending_message_ids.remove(&key).map(|(id, _)| id);
+                            let message = map_message(update.message, client_id).await;
+                            if events.send(BackendEvent::MessageSendSucceeded {
+                                chat_id, old_message_id, local_message_id, message,
+                            }).await.is_err() {
+                                break;
+                            }
+                            if pending_forward == Some(key) {
+                                pending_forward = None;
+                                let _ = events.send(BackendEvent::ForwardFinished { result: Ok(()), discarded_message: None }).await;
+                            }
                         }
+                        tdlib_rs::enums::Update::MessageSendFailed(update) => {
+                            let chat_id = update.message.chat_id;
+                            let old_message_id = update.old_message_id;
+                            let key = (chat_id, old_message_id);
+                            if let Some((message_id, text)) = pending_message_ids.remove(&key)
+                                && events.send(BackendEvent::MessageSendRejected {
+                                    chat_id, message_id, text,
+                                    reason: "Telegram couldn't send the message.".into(),
+                                }).await.is_err()
+                            {
+                                break;
+                            }
+                            if pending_forward == Some(key) {
+                                pending_forward = None;
+                                let _ = events.send(BackendEvent::ForwardFinished {
+                                    result: Err("Telegram couldn't forward the message.".into()),
+                                    discarded_message: Some(key),
+                                }).await;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Some(_) => {}
                 None => break,
@@ -594,12 +669,20 @@ async fn run_supervisor(
             overflow = update_overflows.recv() => match overflow {
                 Some(()) => {
                     warn!("TDLib update queue overflowed; resynchronizing authorization and chats");
+                    if pending_forward.take().is_some() {
+                        let _ = events.send(BackendEvent::ForwardFinished {
+                            result: Err("Telegram did not confirm whether the message was forwarded.".into()),
+                            discarded_message: None,
+                        }).await;
+                    }
                     match tdlib_rs::functions::get_authorization_state(client_id).await {
                         Ok(td_state) => {
                             let state = mapping::authorization_state_from_tdlib(&td_state);
                             if state == AuthorizationState::Closed {
                                 client_closed = true;
                                 main_chats_loaded = false;
+                                pending_message_ids.clear();
+                                pending_forward = None;
                             }
                             if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                                 break;
@@ -648,6 +731,69 @@ async fn resolve_sender_name(sender: mapping::MessageSenderReference, client_id:
     }
 }
 
+async fn resolve_replies(chat_id: i64, message_ids: Vec<i64>, client_id: i32) -> BackendEvent {
+    let previews =
+        iced::futures::future::join_all(message_ids.into_iter().map(|message_id| async move {
+            let preview = tokio::time::timeout(REPLY_LOOKUP_TIMEOUT, async {
+                let tdlib_rs::enums::Message::Message(message) =
+                    tdlib_rs::functions::get_replied_message(chat_id, message_id, client_id)
+                        .await
+                        .ok()?;
+                let sender =
+                    resolve_sender_name(mapping::message_sender(&message), client_id).await;
+                Some(mapping::original_preview(&message, &sender))
+            })
+            .await
+            .ok()
+            .flatten();
+            (message_id, preview)
+        }))
+        .await;
+    BackendEvent::ReplyPreviewsLoaded { chat_id, previews }
+}
+
+async fn forward_message(
+    from_chat_id: i64,
+    message_id: i64,
+    to_chat_id: i64,
+    client_id: i32,
+) -> Result<tdlib_rs::types::Message, &'static str> {
+    const ERROR: &str = "Telegram couldn't forward the message to this chat.";
+    let tdlib_rs::enums::MessageProperties::MessageProperties(properties) =
+        tdlib_rs::functions::get_message_properties(from_chat_id, message_id, client_id)
+            .await
+            .map_err(|_| ERROR)?;
+    if !properties.can_be_forwarded {
+        return Err("This message can't be forwarded.");
+    }
+    let tdlib_rs::enums::Messages::Messages(messages) = tdlib_rs::functions::forward_messages(
+        to_chat_id,
+        None,
+        from_chat_id,
+        vec![message_id],
+        None,
+        false,
+        false,
+        client_id,
+    )
+    .await
+    .map_err(|_| ERROR)?;
+    messages.messages.into_iter().flatten().next().ok_or(ERROR)
+}
+
+async fn map_message(message: tdlib_rs::types::Message, client_id: i32) -> ChatMessage {
+    let sender = resolve_sender_name(mapping::message_sender(&message), client_id).await;
+    let origin_name = match message
+        .forward_info
+        .as_ref()
+        .and_then(|forward| mapping::origin_sender(&forward.origin))
+    {
+        Some(origin) => Some(resolve_sender_name(origin, client_id).await),
+        None => None,
+    };
+    mapping::chat_message(message, sender, origin_name)
+}
+
 async fn map_history_messages(
     messages: Vec<tdlib_rs::types::Message>,
     client_id: i32,
@@ -655,17 +801,36 @@ async fn map_history_messages(
     let mut sender_names: HashMap<mapping::MessageSenderReference, String> = HashMap::new();
     let mut mapped_messages = Vec::with_capacity(messages.len());
     for message in messages {
-        let sender = mapping::message_sender(&message);
-        let sender_name = if let Some(name) = sender_names.get(&sender) {
-            name.clone()
-        } else {
-            let name = resolve_sender_name(sender, client_id).await;
-            sender_names.insert(sender, name.clone());
-            name
+        let sender_name = cached_sender_name(
+            mapping::message_sender(&message),
+            client_id,
+            &mut sender_names,
+        )
+        .await;
+        let origin_name = match message
+            .forward_info
+            .as_ref()
+            .and_then(|forward| mapping::origin_sender(&forward.origin))
+        {
+            Some(origin) => Some(cached_sender_name(origin, client_id, &mut sender_names).await),
+            None => None,
         };
-        mapped_messages.push(mapping::chat_message(message, sender_name));
+        mapped_messages.push(mapping::chat_message(message, sender_name, origin_name));
     }
     mapped_messages
+}
+
+async fn cached_sender_name(
+    sender: mapping::MessageSenderReference,
+    client_id: i32,
+    names: &mut HashMap<mapping::MessageSenderReference, String>,
+) -> String {
+    if let Some(name) = names.get(&sender) {
+        return name.clone();
+    }
+    let name = resolve_sender_name(sender, client_id).await;
+    names.insert(sender, name.clone());
+    name
 }
 
 async fn load_main_chats(client_id: i32, events: &mpsc::Sender<BackendEvent>) -> bool {

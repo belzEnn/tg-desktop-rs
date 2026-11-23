@@ -2,12 +2,13 @@
 
 use tdlib_rs::{
     enums::{
-        AuthorizationState as TdAuthorizationState, ChatList as TdChatList, MessageContent, Update,
+        AuthorizationState as TdAuthorizationState, ChatList as TdChatList, MessageContent,
+        MessageOrigin, MessageReplyTo, Update,
     },
     types::Chat,
 };
 
-use crate::domain::{AuthorizationState, ChatMessage, ChatSummary};
+use crate::domain::{AuthorizationState, ChatMessage, ChatSummary, MessagePreview, MessageReply};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(super) enum MessageSenderReference {
@@ -33,6 +34,7 @@ pub(super) fn chat(chat: &Chat) -> Option<ChatSummary> {
         ),
         unread_count: chat.unread_count.max(0) as u32,
         position: position.order,
+        can_receive_forwards: !matches!(chat.r#type, tdlib_rs::enums::ChatType::Secret(_)),
     })
 }
 
@@ -50,33 +52,21 @@ pub(super) fn message_sender(message: &tdlib_rs::types::Message) -> MessageSende
     }
 }
 
-pub(super) fn new_message_sender(update: &Update) -> Option<MessageSenderReference> {
-    let Update::NewMessage(update) = update else {
-        return None;
-    };
-    Some(message_sender(&update.message))
-}
-
-pub(super) fn new_message_id(update: &Update) -> Option<i64> {
-    let Update::NewMessage(update) = update else {
-        return None;
-    };
-    Some(update.message.id)
-}
-
-pub(super) fn new_message(
-    update: &Update,
-    sender_name: String,
-    message_id: Option<i64>,
-) -> Option<(i64, ChatMessage)> {
-    let Update::NewMessage(update) = update else {
-        return None;
-    };
-    let mut message = chat_message(update.message.clone(), sender_name);
-    if let Some(message_id) = message_id {
-        message.id = message_id;
+pub(super) fn origin_sender(origin: &MessageOrigin) -> Option<MessageSenderReference> {
+    match origin {
+        MessageOrigin::User(origin) => Some(MessageSenderReference::User(origin.sender_user_id)),
+        MessageOrigin::Chat(origin) => Some(MessageSenderReference::Chat(origin.sender_chat_id)),
+        MessageOrigin::Channel(origin) => Some(MessageSenderReference::Chat(origin.chat_id)),
+        MessageOrigin::HiddenUser(_) => None,
     }
-    Some((update.message.chat_id, message))
+}
+
+pub(super) fn input_reply(message_id: i64) -> tdlib_rs::enums::InputMessageReplyTo {
+    tdlib_rs::enums::InputMessageReplyTo::Message(tdlib_rs::types::InputMessageReplyToMessage {
+        message_id,
+        quote: None,
+        checklist_task_id: 0,
+    })
 }
 
 pub(super) fn input_text_content(text: String) -> tdlib_rs::enums::InputMessageContent {
@@ -90,43 +80,49 @@ pub(super) fn input_text_content(text: String) -> tdlib_rs::enums::InputMessageC
     })
 }
 
-pub(super) fn successful_message_sender(update: &Update) -> Option<MessageSenderReference> {
-    let Update::MessageSendSucceeded(update) = update else {
-        return None;
-    };
-    Some(message_sender(&update.message))
-}
-
-pub(super) fn successful_message_id(update: &Update) -> Option<i64> {
-    let Update::MessageSendSucceeded(update) = update else {
-        return None;
-    };
-    Some(update.old_message_id)
-}
-
-pub(super) fn message_send_succeeded(
-    update: &Update,
-    sender_name: String,
-    client_message_id: Option<i64>,
-) -> Option<(i64, i64, ChatMessage)> {
-    let Update::MessageSendSucceeded(update) = update else {
-        return None;
-    };
-    let mut message = chat_message(update.message.clone(), sender_name);
-    if let Some(message_id) = client_message_id {
-        message.id = message_id;
+fn message_text(content: &MessageContent) -> &str {
+    match content {
+        MessageContent::MessageText(text) => &text.text.text,
+        _ => "Unsupported message",
     }
-    Some((update.message.chat_id, update.old_message_id, message))
 }
 
-pub(super) fn message_send_failed(update: &Update) -> Option<(i64, i64)> {
-    let Update::MessageSendFailed(update) = update else {
+pub(super) fn original_preview(
+    message: &tdlib_rs::types::Message,
+    sender_name: &str,
+) -> MessagePreview {
+    MessagePreview::from_text(sender_name, message_text(&message.content))
+}
+
+fn message_reply(message: &mut tdlib_rs::types::Message) -> Option<Box<MessageReply>> {
+    let MessageReplyTo::Message(reply) = message.reply_to.take()? else {
         return None;
     };
-    Some((update.message.chat_id, update.old_message_id))
+    let quote = reply
+        .quote
+        .map(|quote| MessagePreview::snippet(&quote.text.text))
+        .filter(|quote| !quote.is_empty());
+    Some(Box::new(MessageReply {
+        chat_id: reply.chat_id,
+        message_id: reply.message_id,
+        quote,
+        preview: None,
+    }))
 }
 
-pub(super) fn chat_message(message: tdlib_rs::types::Message, sender_name: String) -> ChatMessage {
+pub(super) fn chat_message(
+    mut message: tdlib_rs::types::Message,
+    sender_name: String,
+    origin_name: Option<String>,
+) -> ChatMessage {
+    let reply = message_reply(&mut message);
+    let forwarded_from = message.forward_info.map(|forward| {
+        let name = match &forward.origin {
+            MessageOrigin::HiddenUser(origin) => &origin.sender_name,
+            _ => origin_name.as_deref().unwrap_or("Unknown sender"),
+        };
+        MessagePreview::snippet(name)
+    });
     let text = match message.content {
         MessageContent::MessageText(text) => text.text.text,
         _ => "Unsupported message".into(),
@@ -134,13 +130,12 @@ pub(super) fn chat_message(message: tdlib_rs::types::Message, sender_name: Strin
     ChatMessage {
         id: message.id,
         date: message.date,
-        sender_name: if message.is_outgoing {
-            "You".into()
-        } else {
-            sender_name
-        },
+        sender_name,
         text,
         is_outgoing: message.is_outgoing,
+        can_reference: message.sending_state.is_none(),
+        reply,
+        forwarded_from,
     }
 }
 
