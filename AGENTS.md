@@ -50,7 +50,9 @@ Three layers: `tg` (Telegram backend), `app` (application state and update logic
 
 ## Development Process
 
-1. Start by providing a plan of 5–10 lines and a list of files to be changed. Do not write code until the owner approves the plan.
+1. Before planning a feature or changing existing behavior, inspect the corresponding implementation in the official desktop client. [Telegram Desktop source code](https://github.com/telegramdesktop/tdesktop)
+   Assess whether our implementation can use less memory or respond faster while preserving the expected behavior. If there is no clear improvement, reproduce the relevant logic in our architecture.
+   Summarize what you found and which approach you propose in a plan of 5–10 lines with a list of files to be changed. Do not write code until the owner approves the plan.
 2. One phase per branch, with small steps and commits (`feat`, `fix`, `refactor`, `docs`, `test`, `chore`).
 3. After each step, run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test`, then show the output.
 4. After making changes, briefly explain what was done and why, so the owner can review it.
