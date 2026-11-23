@@ -1,5 +1,7 @@
 // Shared application types, independent of the backend and UI.
 
+use std::borrow::Cow;
+
 /// Telegram authorization progress, independent of the selected backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorizationState {
@@ -105,6 +107,7 @@ pub enum BackendEvent {
     MessageContentChanged {
         address: MessageAddress,
         text: String,
+        text_runs: Box<[TextRun]>,
         is_text: bool,
     },
     /// Telegram marked a message as edited.
@@ -160,6 +163,36 @@ pub enum MessageAction {
     Delete(DeleteScope),
 }
 
+/// Formatting flags that can apply to the same piece of message text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextStyle(u8);
+
+impl TextStyle {
+    pub const BOLD: Self = Self(1 << 0);
+    pub const ITALIC: Self = Self(1 << 1);
+    pub const UNDERLINE: Self = Self(1 << 2);
+    pub const STRIKETHROUGH: Self = Self(1 << 3);
+    pub const CODE: Self = Self(1 << 4);
+    pub const PRE: Self = Self(1 << 5);
+    pub const LINK: Self = Self(1 << 6);
+    pub const SPOILER: Self = Self(1 << 7);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// A contiguous UTF-8 text segment. Its start is zero or the end of the previous segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextRun {
+    pub end: usize,
+    pub style: TextStyle,
+}
+
 /// A message row with backend-independent display text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -167,12 +200,53 @@ pub struct ChatMessage {
     pub date: i32,
     pub sender_name: String,
     pub text: String,
+    /// Empty for plain text. Otherwise covers the full text in byte order.
+    pub text_runs: Box<[TextRun]>,
     pub is_outgoing: bool,
     pub can_reference: bool,
     pub is_text: bool,
     pub is_edited: bool,
+    pub spoilers_revealed: bool,
     pub reply: Option<Box<MessageReply>>,
     pub forwarded_from: Option<Box<str>>,
+}
+
+/// Replaces hidden characters while keeping whitespace and line breaks.
+pub fn spoiler_mask(fragment: &str) -> String {
+    masked_characters(fragment).collect()
+}
+
+fn masked_characters(fragment: &str) -> impl Iterator<Item = char> + '_ {
+    fragment
+        .chars()
+        .map(|ch| if ch.is_whitespace() { ch } else { '•' })
+}
+
+/// Masks all spoilers in a preview regardless of their state in the history.
+pub fn conceal_spoilers<'a>(text: &'a str, runs: &[TextRun]) -> Cow<'a, str> {
+    if !runs
+        .iter()
+        .any(|run| run.style.contains(TextStyle::SPOILER))
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut masked = String::new();
+    let mut start = 0;
+    for run in runs {
+        let Some(fragment) = text.get(start..run.end) else {
+            return Cow::Borrowed("•••");
+        };
+        if run.style.contains(TextStyle::SPOILER) {
+            masked.extend(masked_characters(fragment));
+        } else {
+            masked.push_str(fragment);
+        }
+        start = run.end;
+    }
+    if start != text.len() {
+        return Cow::Borrowed("•••");
+    }
+    Cow::Owned(masked)
 }
 
 /// The address and display data of a reply's original message.
@@ -192,11 +266,15 @@ pub struct MessagePreview {
 }
 
 impl MessagePreview {
-    pub fn from_text(sender_name: &str, text: &str) -> Self {
+    pub fn from_text(sender_name: &str, text: &str, runs: &[TextRun]) -> Self {
         Self {
             sender_name: Some(Self::snippet(sender_name)),
-            text: Self::snippet(text),
+            text: Self::message_snippet(text, runs),
         }
+    }
+
+    pub fn message_snippet(text: &str, runs: &[TextRun]) -> Box<str> {
+        Self::snippet(&conceal_spoilers(text, runs))
     }
 
     pub fn snippet(text: &str) -> Box<str> {
@@ -255,7 +333,7 @@ mod tests {
     #[test]
     fn preview_is_single_line_and_truncates_at_character_boundaries() {
         let text = format!("  one\ntwo {}  ", "я".repeat(101));
-        let preview = MessagePreview::from_text(" Anna ", &text);
+        let preview = MessagePreview::from_text(" Anna ", &text, &[]);
 
         assert_eq!(preview.sender_name.as_deref(), Some("Anna"));
         assert_eq!(preview.text.chars().count(), 101);

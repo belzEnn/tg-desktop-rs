@@ -147,3 +147,16 @@ ID at sign-in so Saved Messages can be excluded.
 RSS after login, after opening a 50-message chat, and after one idle hour
 remains pending, along with the delay from viewing a message to the unread
 count changing on Telegram's test DC.
+
+## Phase 6.4 — text entities
+
+Each formatted row stores byte boundaries and combined style flags beside
+its existing text. Plain rows allocate no formatting runs and use the plain
+text widget. Styled fragments borrow the original text. UTF-16 conversion
+and span sorting run when TDLib content arrives. The conversion table is
+temporary. Spoiler reveal state lives on the loaded message row. The UI
+builds masked fragments only for concealed spoilers.
+
+RSS after login, after opening a 50-message chat, and after one idle hour
+remains pending, along with rendering and live edit verification on
+Telegram's test DC.

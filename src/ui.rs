@@ -1,23 +1,29 @@
 // Iced window and user interface.
 
+use std::borrow::Cow;
+
 use iced::{
-    Element, Event, Fill, Length, Point, Rectangle, Renderer, Size, Theme, Vector,
+    Color, Element, Event, Fill, Font, Length, Point, Rectangle, Renderer, Size, Theme, Vector,
     advanced::{
         Clipboard, Layout, Shell, Widget, layout, renderer,
         widget::{Id, Operation, Tree, operation, tree},
     },
+    font,
     keyboard::{Key, key::Named},
     mouse,
     widget::{
-        button, center, column, container, mouse_area, opaque, pin, responsive, row, scrollable,
-        space, stack, text, text_editor, text_input,
+        button, center, column, container, mouse_area, opaque, pin, responsive, rich_text, row,
+        scrollable, space, span, stack, text, text_editor, text_input,
     },
     window,
 };
 
 use crate::{
     app,
-    domain::{AuthorizationState, ChatMessage, DeleteScope, MessageAddress, MessagePreview},
+    domain::{
+        AuthorizationState, ChatMessage, DeleteScope, MessageAddress, MessagePreview, TextStyle,
+        conceal_spoilers, spoiler_mask,
+    },
     tg::Adapter,
 };
 
@@ -194,8 +200,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                             .and_then(|preview| preview.sender_name.as_deref());
                         body = body.push(reply_preview(sender, reply.display_text()));
                     }
-                    body =
-                        body.push(text(&message.text).wrapping(iced::widget::text::Wrapping::Word));
+                    body = body.push(message_text(chat.id, message));
                     let content = container(body).padding(10);
                     history = if message.can_reference {
                         history.push(mouse_area(content).on_right_press(HistoryEvent::OpenMenu {
@@ -255,7 +260,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                         conversation = conversation.push(
                             text(format!(
                                 "Forward message: {}",
-                                MessagePreview::snippet(&source.text)
+                                MessagePreview::message_snippet(&source.text, &source.text_runs)
                             ))
                             .size(12),
                         );
@@ -314,7 +319,8 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                         .spacing(8),
                     );
                 } else if let Some(original) = state.reply_message() {
-                    let snippet = MessagePreview::snippet(&original.text);
+                    let snippet =
+                        MessagePreview::message_snippet(&original.text, &original.text_runs);
                     conversation = conversation.push(
                         row![
                             reply_preview(Some(&original.sender_name), snippet.into_string()),
@@ -364,8 +370,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                         state
                             .messages()
                             .iter()
-                            .find(|message| message.id == confirmation.message_id)
-                            .map(|message| message.text.as_str()),
+                            .find(|message| message.id == confirmation.message_id),
                         state.mutation_pending(),
                         state.message_action_error(),
                     ));
@@ -482,7 +487,7 @@ fn menu_position(cursor: Point, available: Size, height: f32) -> Point {
 
 fn delete_confirmation<'a>(
     confirmation: &app::DeleteConfirmation,
-    original: Option<&str>,
+    original: Option<&ChatMessage>,
     pending: bool,
     error: Option<&'a str>,
 ) -> Element<'a, app::Message> {
@@ -518,7 +523,12 @@ fn delete_confirmation<'a>(
     ]
     .spacing(12);
     if let Some(original) = original {
-        dialog = dialog.push(text(MessagePreview::snippet(original).into_string()).size(13));
+        dialog = dialog.push(
+            text(
+                MessagePreview::message_snippet(&original.text, &original.text_runs).into_string(),
+            )
+            .size(13),
+        );
     }
     dialog = dialog.push(actions);
     if let Some(error) = error {
@@ -534,6 +544,7 @@ fn delete_confirmation<'a>(
 enum HistoryEvent {
     Scrolled { offset_y: f32, content_height: f32 },
     OpenMenu { chat_id: i64, message_id: i64 },
+    RevealSpoilers(MessageAddress),
 }
 
 // Scrollable translates cursor coordinates for its children. Keep row hit
@@ -711,6 +722,7 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
                 offset_y,
                 content_height,
             },
+            HistoryEvent::RevealSpoilers(address) => app::Message::RevealSpoilers(address),
             HistoryEvent::OpenMenu {
                 chat_id,
                 message_id,
@@ -738,6 +750,94 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
             }
         }
     }
+}
+
+fn message_text(chat_id: i64, message: &ChatMessage) -> Element<'_, HistoryEvent> {
+    let plain = || {
+        let content = if message.spoilers_revealed {
+            Cow::Borrowed(message.text.as_str())
+        } else {
+            conceal_spoilers(&message.text, &message.text_runs)
+        };
+        let widget = match content {
+            Cow::Borrowed(fragment) => text(fragment),
+            Cow::Owned(fragment) => text(fragment),
+        };
+        widget.wrapping(text::Wrapping::Word).into()
+    };
+    if message.text_runs.is_empty() {
+        return plain();
+    }
+
+    let mut start = 0;
+    let mut spans = Vec::with_capacity(message.text_runs.len());
+    let mut hidden = false;
+    for run in &message.text_runs {
+        let Some(fragment) = message.text.get(start..run.end) else {
+            return plain();
+        };
+        if !message.spoilers_revealed && run.style.contains(TextStyle::SPOILER) {
+            hidden = true;
+            spans.push(spoiler_span(fragment));
+        } else {
+            spans.push(message_span(fragment, run.style));
+        }
+        start = run.end;
+    }
+    if start != message.text.len() {
+        return plain();
+    }
+    let rich = rich_text(spans).wrapping(text::Wrapping::Word);
+    if hidden {
+        rich.on_link_click(move |()| {
+            HistoryEvent::RevealSpoilers(MessageAddress {
+                chat_id,
+                message_id: message.id,
+            })
+        })
+        .into()
+    } else {
+        rich.into()
+    }
+}
+
+fn spoiler_span(fragment: &str) -> text::Span<'_, (), Font> {
+    span(spoiler_mask(fragment))
+        .background(Color::from_rgba(0.48, 0.50, 0.54, 0.24))
+        .link(())
+}
+
+fn message_span(fragment: &str, style: TextStyle) -> text::Span<'_, (), Font> {
+    let bold = style.contains(TextStyle::BOLD);
+    let italic = style.contains(TextStyle::ITALIC);
+    let pre = style.contains(TextStyle::PRE);
+    let monospace = pre || style.contains(TextStyle::CODE);
+    let link = style.contains(TextStyle::LINK);
+    let mut segment = span(fragment)
+        .underline(link || style.contains(TextStyle::UNDERLINE))
+        .strikethrough(style.contains(TextStyle::STRIKETHROUGH));
+    if bold || italic || monospace {
+        let mut font = if monospace {
+            Font::MONOSPACE
+        } else {
+            Font::DEFAULT
+        };
+        if bold {
+            font.weight = font::Weight::Bold;
+        }
+        if italic {
+            font.style = font::Style::Italic;
+        }
+        segment = segment.font(font);
+    }
+    if monospace {
+        let opacity = if pre { 0.24 } else { 0.16 };
+        segment = segment.background(Color::from_rgba(0.48, 0.50, 0.54, opacity));
+    }
+    if link {
+        segment = segment.color(Color::from_rgb(0.26, 0.47, 0.75));
+    }
+    segment
 }
 
 fn outgoing_check_mark(message: &ChatMessage, read_through: Option<i64>) -> Option<&'static str> {
@@ -894,10 +994,12 @@ mod tests {
             date: 0,
             sender_name: String::new(),
             text: String::new(),
+            text_runs: Box::default(),
             is_outgoing: id == 3,
             can_reference: true,
             is_text: true,
             is_edited: false,
+            spoilers_revealed: false,
             reply: None,
             forwarded_from: None,
         });
@@ -970,10 +1072,12 @@ mod tests {
             date: 0,
             sender_name: "You".into(),
             text: "Hello".into(),
+            text_runs: Box::default(),
             is_outgoing: true,
             can_reference: true,
             is_text: true,
             is_edited: false,
+            spoilers_revealed: false,
             reply: None,
             forwarded_from: None,
         };
@@ -986,5 +1090,82 @@ mod tests {
         message.can_reference = true;
         message.is_outgoing = false;
         assert_eq!(outgoing_check_mark(&message, Some(43)), None);
+    }
+
+    #[test]
+    fn span_keeps_preformatted_whitespace_and_combines_visual_styles() {
+        let formatted = message_span("a\n  b", TextStyle::PRE.union(TextStyle::BOLD));
+        let font = formatted.font.unwrap();
+        assert_eq!(font.family, Font::MONOSPACE.family);
+        assert_eq!(font.weight, font::Weight::Bold);
+        assert_eq!(formatted.text.as_ref(), "a\n  b");
+        assert!(formatted.highlight.is_some());
+
+        let link = message_span(
+            "link",
+            TextStyle::LINK
+                .union(TextStyle::ITALIC)
+                .union(TextStyle::STRIKETHROUGH),
+        );
+        assert!(link.underline && link.strikethrough && link.color.is_some());
+        assert_eq!(link.font.unwrap().style, font::Style::Italic);
+    }
+
+    #[test]
+    fn concealed_span_handles_a_click_without_exposing_its_text() {
+        use crate::domain::TextRun;
+        use iced::{Pixels, advanced::clipboard};
+
+        let hidden = spoiler_span("🙂 x");
+        assert_eq!(hidden.text.as_ref(), "• •");
+        let message = ChatMessage {
+            id: 42,
+            date: 0,
+            sender_name: String::new(),
+            text: "secret🙂".into(),
+            text_runs: Box::new([TextRun {
+                end: "secret🙂".len(),
+                style: TextStyle::SPOILER,
+            }]),
+            is_outgoing: false,
+            can_reference: true,
+            is_text: true,
+            is_edited: false,
+            spoilers_revealed: false,
+            reply: None,
+            forwarded_from: None,
+        };
+        let mut content = message_text(17, &message);
+        let renderer = Renderer::new(Font::default(), Pixels(16.0));
+        let mut tree = Tree::new(&content);
+        let size = Size::new(320.0, 100.0);
+        let node = content.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let mut events = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            content.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(5.0, 5.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut events),
+                &Rectangle::with_size(size),
+            );
+        }
+        assert!(matches!(
+            events.as_slice(),
+            [HistoryEvent::RevealSpoilers(MessageAddress {
+                chat_id: 17,
+                message_id: 42,
+            })]
+        ));
     }
 }

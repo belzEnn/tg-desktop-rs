@@ -98,18 +98,18 @@ measurements.
 
 ## 6. Message essentials
 
-- **6.1 Replies and forwarding.** 🚧 Reply previews and reply composition.
+- **6.1 Replies and forwarding.** ✅ Reply previews and reply composition.
   Right-click a message to reply or forward it to another chat. Test-DC
   verification and RSS measurements pending.
-- **6.2 Edit and delete.** 🚧 Edit or delete your own messages from the context
+- **6.2 Edit and delete.** ✅ Edit or delete your own messages from the context
   menu. History updates live. Test-DC verification and RSS measurements
   pending.
-- **6.3 Mark as read.** 🚧 Mark viewed messages in the focused window,
+- **6.3 Mark as read.** ✅ Mark viewed messages in the focused window,
   refresh unread counters from TDLib, and show read checks for outgoing
   messages in private chats. Test-DC verification and RSS measurements pending.
-- **6.4 Text entities.** ☐ Bold, italic, underline, strikethrough, `code`,
-  `pre` and links in message text; malformed spans dropped, unknown types
-  ignored.
+- **6.4 Text entities.** ✅ Render bold, italic, underline, strikethrough,
+  `code`, `pre`, links and click-to-reveal spoilers. Hide spoilers in previews.
+  Test-DC verification and RSS measurements pending.
 
 ## 7. Scrolling at scale
 

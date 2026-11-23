@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     domain::{
         AuthorizationState, BackendEvent, ChatMessage, ChatSummary, DeleteScope, MessageAction,
-        MessageActions, MessageAddress, MessagePreview, MessageReply,
+        MessageActions, MessageAddress, MessagePreview, MessageReply, TextRun, TextStyle,
+        conceal_spoilers,
     },
     tg::{Adapter, AdapterCommandError},
 };
@@ -142,6 +143,7 @@ pub(crate) enum Message {
         position: Point,
     },
     DismissMessageMenu,
+    RevealSpoilers(MessageAddress),
     Escape,
     StartEdit(i64),
     CancelEdit,
@@ -459,18 +461,20 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::BackendEvent(BackendEvent::MessageContentChanged {
             address,
             text,
+            text_runs,
             is_text,
         }) => {
             if let Some(chat) = state.chats.iter_mut().find(|chat| {
                 chat.id == address.chat_id && chat.last_message_id == Some(address.message_id)
             }) {
-                chat.last_message_preview.clone_from(&text);
+                chat.last_message_preview = conceal_spoilers(&text, &text_runs).into_owned();
             }
             apply_message_content(
                 &mut state.messages,
                 state.open_chat_id,
                 address,
                 text,
+                text_runs,
                 is_text,
             );
         }
@@ -482,6 +486,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                     .find(|message| message.id == address.message_id)
             {
                 message.is_edited = true;
+                message.spoilers_revealed = false;
             }
         }
         Message::BackendEvent(BackendEvent::MessagesDeleted {
@@ -776,6 +781,20 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::RevealSpoilers(address) => {
+            if state.open_chat_id == Some(address.chat_id)
+                && let Some(message) = state
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == address.message_id)
+                && message
+                    .text_runs
+                    .iter()
+                    .any(|run| run.style.contains(TextStyle::SPOILER))
+            {
+                message.spoilers_revealed = true;
+            }
+        }
         Message::DismissMessageMenu => state.message_menu = None,
         Message::Escape => {
             if state.message_menu.take().is_none()
@@ -966,6 +985,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                     preview: Some(MessagePreview::from_text(
                         &original.sender_name,
                         &original.text,
+                        &original.text_runs,
                     )),
                 })
             });
@@ -980,10 +1000,12 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                     date: current_unix_timestamp(),
                     sender_name: "You".into(),
                     text: text.clone(),
+                    text_runs: Box::default(),
                     is_outgoing: true,
                     can_reference: false,
                     is_text: true,
                     is_edited: false,
+                    spoilers_revealed: false,
                     reply,
                     forwarded_from: None,
                 },
@@ -1179,6 +1201,7 @@ fn apply_message_content(
     open_chat_id: Option<i64>,
     address: MessageAddress,
     text: String,
+    text_runs: Box<[TextRun]>,
     is_text: bool,
 ) {
     let original_index = (open_chat_id == Some(address.chat_id))
@@ -1197,7 +1220,7 @@ fn apply_message_content(
                     && reply.quote.is_none()
             })
         })
-        .then(|| MessagePreview::snippet(&text));
+        .then(|| MessagePreview::message_snippet(&text, &text_runs));
 
     if let Some(snippet) = snippet {
         let sender =
@@ -1224,6 +1247,8 @@ fn apply_message_content(
     }
     if let Some(index) = original_index {
         messages[index].text = text;
+        messages[index].text_runs = text_runs;
+        messages[index].spoilers_revealed = false;
         messages[index].is_text = is_text;
     }
 }
@@ -1302,7 +1327,11 @@ fn collect_reply_lookups(messages: &mut [ChatMessage], chat_id: i64, enqueue: bo
             .flatten()
             .map(|&index| &messages[index]);
         if let Some(original) = original {
-            let preview = MessagePreview::from_text(&original.sender_name, &original.text);
+            let preview = MessagePreview::from_text(
+                &original.sender_name,
+                &original.text,
+                &original.text_runs,
+            );
             if let Some(reply) = &mut messages[index].reply {
                 reply.resolve(Some(preview));
             }
@@ -1505,10 +1534,12 @@ mod tests {
             date: 0,
             sender_name: "Anna".into(),
             text: "first line\nsecond line".into(),
+            text_runs: Box::default(),
             is_outgoing: false,
             can_reference: true,
             is_text: true,
             is_edited: false,
+            spoilers_revealed: false,
             reply: None,
             forwarded_from: None,
         }
@@ -1585,6 +1616,7 @@ mod tests {
                 message_id: 1,
             },
             "updated text".into(),
+            Box::default(),
             true,
         );
 
@@ -1847,5 +1879,106 @@ mod tests {
         assert_eq!(private_chat.unread_count, 4);
         let unsupported = state.chats.iter().find(|chat| chat.id == 20).unwrap();
         assert_eq!(unsupported.last_read_outbox_message_id, None);
+    }
+
+    #[test]
+    fn live_content_updates_replace_styles_even_when_text_is_unchanged() {
+        let (mut state, _) = boot(Adapter::for_tests());
+        state.open_chat_id = Some(10);
+        let mut original = message(1);
+        original.text = "unchanged".into();
+        original.text_runs = Box::new([TextRun {
+            end: 9,
+            style: TextStyle::BOLD,
+        }]);
+        state.messages.push(original);
+
+        let updates: [Box<[TextRun]>; 2] = [
+            Box::new([TextRun {
+                end: 9,
+                style: TextStyle::ITALIC,
+            }]),
+            Box::default(),
+        ];
+        for text_runs in updates {
+            let _ = update(
+                &mut state,
+                Message::BackendEvent(BackendEvent::MessageContentChanged {
+                    address: MessageAddress {
+                        chat_id: 10,
+                        message_id: 1,
+                    },
+                    text: "unchanged".into(),
+                    text_runs: text_runs.clone(),
+                    is_text: true,
+                }),
+            );
+            assert_eq!(state.messages[0].text_runs, text_runs);
+            assert_eq!(state.messages[0].text, "unchanged");
+        }
+    }
+
+    #[test]
+    fn revealing_a_spoiler_keeps_previews_masked_and_an_edit_hides_it_again() {
+        let (mut state, _) = boot(Adapter::for_tests());
+        state.open_chat_id = Some(10);
+        let mut chat = unread_chat(10);
+        chat.last_message_id = Some(1);
+        state.chats.push(chat);
+        state.messages = vec![message(1), reply(2, 10, 1)];
+        let runs = || {
+            Box::<[TextRun]>::from([
+                TextRun {
+                    end: 5,
+                    style: TextStyle::default(),
+                },
+                TextRun {
+                    end: 8,
+                    style: TextStyle::SPOILER,
+                },
+            ])
+        };
+        let address = MessageAddress {
+            chat_id: 10,
+            message_id: 1,
+        };
+        let change = |text: &str| {
+            Message::BackendEvent(BackendEvent::MessageContentChanged {
+                address,
+                text: text.into(),
+                text_runs: runs(),
+                is_text: true,
+            })
+        };
+        let _ = update(&mut state, change("hint one"));
+        let _ = update(
+            &mut state,
+            Message::RevealSpoilers(MessageAddress {
+                chat_id: 20,
+                ..address
+            }),
+        );
+        assert!(!state.messages[0].spoilers_revealed);
+
+        let _ = update(&mut state, Message::RevealSpoilers(address));
+        assert!(state.messages[0].spoilers_revealed);
+        assert_eq!(state.chats[0].last_message_preview, "hint •••");
+        assert_eq!(
+            state.messages[1].reply.as_ref().unwrap().display_text(),
+            "hint •••"
+        );
+        assert_eq!(
+            MessagePreview::message_snippet(&state.messages[0].text, &state.messages[0].text_runs)
+                .as_ref(),
+            "hint •••"
+        );
+
+        let _ = update(&mut state, change("hint two"));
+        assert!(!state.messages[0].spoilers_revealed);
+        assert_eq!(state.messages[0].text, "hint two");
+        assert_eq!(state.chats[0].last_message_preview, "hint •••");
+        let _ = update(&mut state, Message::RevealSpoilers(address));
+        let _ = update(&mut state, Message::OpenChat(20));
+        assert!(state.messages.is_empty());
     }
 }

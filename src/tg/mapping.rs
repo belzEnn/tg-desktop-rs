@@ -1,16 +1,18 @@
 //! Conversions from TDLib updates into shared application events.
 
+use std::{borrow::Cow, cmp::Reverse};
+
 use tdlib_rs::{
     enums::{
         AuthorizationState as TdAuthorizationState, ChatList as TdChatList, MessageContent,
-        MessageOrigin, MessageReplyTo, Update,
+        MessageOrigin, MessageReplyTo, TextEntityType, Update,
     },
-    types::Chat,
+    types::{Chat, FormattedText, TextEntity},
 };
 
 use crate::domain::{
     AuthorizationState, BackendEvent, ChatMessage, ChatSummary, MessageActions, MessageAddress,
-    MessagePreview, MessageReply,
+    MessagePreview, MessageReply, TextRun, TextStyle, conceal_spoilers,
 };
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -39,10 +41,7 @@ pub(super) fn chat(chat: &Chat, account_user_id: Option<i64>) -> Option<ChatSumm
         last_message_id: chat.last_message.as_ref().map(|message| message.id),
         last_message_preview: chat.last_message.as_ref().map_or_else(
             || "No messages yet".into(),
-            |message| match &message.content {
-                MessageContent::MessageText(text) => text.text.text.clone(),
-                _ => "Unsupported message".into(),
-            },
+            |message| preview_text(&message.content).into_owned(),
         ),
         unread_count: chat.unread_count.max(0) as u32,
         last_read_inbox_message_id: chat.last_read_inbox_message_id,
@@ -97,10 +96,22 @@ pub(super) fn input_text_content(
     })
 }
 
-fn message_text(content: &MessageContent) -> &str {
+fn formatted_preview(formatted: &FormattedText) -> Cow<'_, str> {
+    if !formatted
+        .entities
+        .iter()
+        .any(|entity| entity.r#type == TextEntityType::Spoiler)
+    {
+        return Cow::Borrowed(&formatted.text);
+    }
+    let runs = text_runs(&formatted.text, &formatted.entities);
+    conceal_spoilers(&formatted.text, &runs)
+}
+
+fn preview_text(content: &MessageContent) -> Cow<'_, str> {
     match content {
-        MessageContent::MessageText(text) => &text.text.text,
-        _ => "Unsupported message",
+        MessageContent::MessageText(message) => formatted_preview(&message.text),
+        _ => Cow::Borrowed("Unsupported message"),
     }
 }
 
@@ -108,7 +119,7 @@ pub(super) fn original_preview(
     message: &tdlib_rs::types::Message,
     sender_name: &str,
 ) -> MessagePreview {
-    MessagePreview::from_text(sender_name, message_text(&message.content))
+    MessagePreview::from_text(sender_name, &preview_text(&message.content), &[])
 }
 
 fn message_reply(message: &mut tdlib_rs::types::Message) -> Option<Box<MessageReply>> {
@@ -117,7 +128,7 @@ fn message_reply(message: &mut tdlib_rs::types::Message) -> Option<Box<MessageRe
     };
     let quote = reply
         .quote
-        .map(|quote| MessagePreview::snippet(&quote.text.text))
+        .map(|quote| MessagePreview::snippet(&formatted_preview(&quote.text)))
         .filter(|quote| !quote.is_empty());
     Some(Box::new(MessageReply {
         chat_id: reply.chat_id,
@@ -140,25 +151,134 @@ pub(super) fn chat_message(
         };
         MessagePreview::snippet(name)
     });
-    let (text, is_text) = display_content(message.content);
+    let (text, text_runs, is_text) = display_content(message.content);
     ChatMessage {
         id: message.id,
         date: message.date,
         sender_name,
         text,
+        text_runs,
         is_outgoing: message.is_outgoing,
         can_reference: message.sending_state.is_none(),
         is_text,
         is_edited: message.edit_date > 0,
+        spoilers_revealed: false,
         reply,
         forwarded_from,
     }
 }
 
-fn display_content(content: MessageContent) -> (String, bool) {
+fn display_content(content: MessageContent) -> (String, Box<[TextRun]>, bool) {
     match content {
-        MessageContent::MessageText(text) => (text.text.text, true),
-        _ => ("Unsupported message".into(), false),
+        MessageContent::MessageText(message) => {
+            let FormattedText { text, entities } = message.text;
+            let runs = text_runs(&text, &entities);
+            (text, runs, true)
+        }
+        _ => ("Unsupported message".into(), Box::default(), false),
+    }
+}
+
+fn entity_style(kind: &TextEntityType) -> Option<TextStyle> {
+    Some(match kind {
+        TextEntityType::Spoiler => TextStyle::SPOILER,
+        TextEntityType::Bold => TextStyle::BOLD,
+        TextEntityType::Italic => TextStyle::ITALIC,
+        TextEntityType::Underline => TextStyle::UNDERLINE,
+        TextEntityType::Strikethrough => TextStyle::STRIKETHROUGH,
+        TextEntityType::Code => TextStyle::CODE,
+        TextEntityType::Pre | TextEntityType::PreCode(_) => TextStyle::PRE,
+        TextEntityType::Url | TextEntityType::TextUrl(_) => TextStyle::LINK,
+        _ => return None,
+    })
+}
+
+fn text_runs(text: &str, entities: &[TextEntity]) -> Box<[TextRun]> {
+    if entities.is_empty() {
+        return Box::default();
+    }
+    let ascii = text.is_ascii();
+    let mut boundaries = None;
+    let mut spans: Vec<_> = entities
+        .iter()
+        .filter_map(|entity| {
+            let style = entity_style(&entity.r#type)?;
+            let start = usize::try_from(entity.offset).ok()?;
+            let length = usize::try_from(entity.length).ok()?;
+            let end = start.checked_add(length)?;
+            if start == end || end > text.len() {
+                return None;
+            }
+            if ascii {
+                return Some((start, end, style));
+            }
+            let boundaries = boundaries.get_or_insert_with(|| utf16_boundaries(text));
+            let start = *boundaries.get(start)?;
+            let end = *boundaries.get(end)?;
+            (start != usize::MAX && end != usize::MAX).then_some((start, end, style))
+        })
+        .collect();
+    if spans.is_empty() {
+        return Box::default();
+    }
+
+    // Visit enclosing spans first. A span that crosses an enclosing span's end
+    // cannot be nested and is discarded.
+    spans.sort_unstable_by_key(|&(start, end, _)| (start, Reverse(end)));
+    let mut active: Vec<TextRun> = Vec::new();
+    let mut runs = Vec::new();
+    for (start, end, style) in spans {
+        while let Some(finished) = active.last().filter(|run| run.end <= start) {
+            append_run(&mut runs, finished.end, finished.style);
+            active.pop();
+        }
+        if active.last().is_some_and(|parent| end > parent.end) {
+            if style == TextStyle::SPOILER {
+                // A broken style range must not expose known hidden text.
+                return Box::new([TextRun {
+                    end: text.len(),
+                    style: TextStyle::SPOILER,
+                }]);
+            }
+            continue;
+        }
+        let outer = active
+            .last()
+            .map_or_else(TextStyle::default, |run| run.style);
+        append_run(&mut runs, start, outer);
+        active.push(TextRun {
+            end,
+            style: outer.union(style),
+        });
+    }
+    for run in active.into_iter().rev() {
+        append_run(&mut runs, run.end, run.style);
+    }
+    append_run(&mut runs, text.len(), TextStyle::default());
+    runs.into_boxed_slice()
+}
+
+fn utf16_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    for (index, ch) in text.char_indices() {
+        boundaries.push(index);
+        if ch.len_utf16() == 2 {
+            // This UTF-16 offset splits a surrogate pair.
+            boundaries.push(usize::MAX);
+        }
+    }
+    boundaries.push(text.len());
+    boundaries
+}
+
+fn append_run(runs: &mut Vec<TextRun>, end: usize, style: TextStyle) {
+    if end <= runs.last().map_or(0, |run| run.end) {
+        return;
+    }
+    if let Some(last) = runs.last_mut().filter(|run| run.style == style) {
+        last.end = end;
+    } else {
+        runs.push(TextRun { end, style });
     }
 }
 
@@ -183,13 +303,14 @@ pub(super) fn message_change(update: Update) -> Option<BackendEvent> {
             last_read_message_id: update.last_read_outbox_message_id,
         }),
         Update::MessageContent(update) => {
-            let (text, is_text) = display_content(update.new_content);
+            let (text, text_runs, is_text) = display_content(update.new_content);
             Some(BackendEvent::MessageContentChanged {
                 address: MessageAddress {
                     chat_id: update.chat_id,
                     message_id: update.message_id,
                 },
                 text,
+                text_runs,
                 is_text,
             })
         }
@@ -329,5 +450,170 @@ mod tests {
                 message_ids: vec![2]
             }),
         );
+    }
+
+    fn entity(offset: i32, length: i32, kind: TextEntityType) -> TextEntity {
+        TextEntity {
+            offset,
+            length,
+            r#type: kind,
+        }
+    }
+
+    #[test]
+    fn utf16_offsets_keep_whole_unicode_scalars_and_drop_invalid_entities() {
+        let text = "a🙂бz";
+        let entities = [
+            entity(3, 1, TextEntityType::Bold),
+            entity(1, 2, TextEntityType::Underline),
+            entity(2, 1, TextEntityType::Italic), // Starts inside the emoji.
+            entity(0, 2, TextEntityType::Strikethrough), // Ends inside the emoji.
+            entity(-1, 3, TextEntityType::Italic),
+            entity(0, 0, TextEntityType::Url),
+            entity(4, 2, TextEntityType::Code), // Beyond the UTF-16 length.
+            entity(4, 1, TextEntityType::Mention), // Unsupported type.
+        ];
+
+        assert_eq!(
+            &*text_runs(text, &entities),
+            &[
+                TextRun {
+                    end: 1,
+                    style: TextStyle::default()
+                },
+                TextRun {
+                    end: "a🙂".len(),
+                    style: TextStyle::UNDERLINE
+                },
+                TextRun {
+                    end: "a🙂б".len(),
+                    style: TextStyle::BOLD
+                },
+                TextRun {
+                    end: text.len(),
+                    style: TextStyle::default()
+                },
+            ]
+        );
+        assert!(text_runs(text, &entities[2..]).is_empty());
+    }
+
+    #[test]
+    fn nested_entities_combine_and_a_crossing_range_is_ignored() {
+        let entities = [
+            entity(2, 2, TextEntityType::Italic),
+            entity(1, 5, TextEntityType::Bold),
+            entity(3, 4, TextEntityType::Strikethrough), // Crosses the enclosing spans.
+        ];
+        assert_eq!(
+            &*text_runs("abcdefgh", &entities),
+            &[
+                TextRun {
+                    end: 1,
+                    style: TextStyle::default()
+                },
+                TextRun {
+                    end: 2,
+                    style: TextStyle::BOLD
+                },
+                TextRun {
+                    end: 4,
+                    style: TextStyle::BOLD.union(TextStyle::ITALIC)
+                },
+                TextRun {
+                    end: 6,
+                    style: TextStyle::BOLD
+                },
+                TextRun {
+                    end: 8,
+                    style: TextStyle::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tdlib_content_update_carries_preformatted_text_and_link_runs() {
+        use tdlib_rs::types::{
+            MessageText, TextEntityTypePreCode, TextEntityTypeTextUrl, UpdateMessageContent,
+        };
+
+        let text = "a\n  b link";
+        let update = Update::MessageContent(UpdateMessageContent {
+            chat_id: 17,
+            message_id: 42,
+            new_content: MessageContent::MessageText(MessageText {
+                text: FormattedText {
+                    text: text.into(),
+                    entities: vec![
+                        entity(
+                            0,
+                            5,
+                            TextEntityType::PreCode(TextEntityTypePreCode {
+                                language: "rust".into(),
+                            }),
+                        ),
+                        entity(
+                            6,
+                            4,
+                            TextEntityType::TextUrl(TextEntityTypeTextUrl {
+                                url: "https://example.com".into(),
+                            }),
+                        ),
+                    ],
+                },
+                link_preview: None,
+                link_preview_options: None,
+            }),
+        });
+        assert_eq!(
+            message_change(update),
+            Some(BackendEvent::MessageContentChanged {
+                address: MessageAddress {
+                    chat_id: 17,
+                    message_id: 42
+                },
+                text: text.into(),
+                text_runs: Box::new([
+                    TextRun {
+                        end: 5,
+                        style: TextStyle::PRE
+                    },
+                    TextRun {
+                        end: 6,
+                        style: TextStyle::default()
+                    },
+                    TextRun {
+                        end: 10,
+                        style: TextStyle::LINK
+                    },
+                ]),
+                is_text: true,
+            })
+        );
+    }
+
+    #[test]
+    fn formatted_preview_masks_spoilers_and_preserves_visible_unicode() {
+        let formatted = FormattedText {
+            text: "я 🙂x конец".into(),
+            entities: vec![
+                entity(2, 3, TextEntityType::Spoiler),
+                entity(4, 1, TextEntityType::Bold),
+            ],
+        };
+        assert_eq!(formatted_preview(&formatted), "я •• конец");
+    }
+
+    #[test]
+    fn crossing_formatting_does_not_expose_a_spoiler_in_a_preview() {
+        let formatted = FormattedText {
+            text: "abcdef".into(),
+            entities: vec![
+                entity(0, 4, TextEntityType::Bold),
+                entity(2, 4, TextEntityType::Spoiler),
+            ],
+        };
+        assert_eq!(formatted_preview(&formatted), "••••••");
     }
 }
