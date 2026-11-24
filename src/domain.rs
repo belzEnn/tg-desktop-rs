@@ -317,6 +317,8 @@ pub struct ChatSummary {
     pub id: i64,
     pub title: String,
     pub last_message_id: Option<i64>,
+    pub last_message_date: Option<i32>,
+    pub last_message_is_outgoing: bool,
     pub last_message_preview: String,
     pub unread_count: u32,
     pub last_read_inbox_message_id: i64,

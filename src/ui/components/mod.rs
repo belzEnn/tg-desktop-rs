@@ -48,3 +48,17 @@ pub(super) fn chat_header<'a>(
     .padding([0, m::CONVERSATION_PADDING])
     .into()
 }
+
+fn time_label(unix_seconds: i32) -> String {
+    let minutes = unix_seconds / 60;
+    format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60)
+}
+
+fn delivery_mark(message_id: i64, read_through: Option<i64>) -> Option<&'static str> {
+    let read_through = read_through?;
+    (message_id > 0).then_some(if message_id <= read_through {
+        "✓✓"
+    } else {
+        "✓"
+    })
+}

@@ -19,12 +19,12 @@ pub(crate) fn sidebar_width(window_width: f32) -> f32 {
         .round()
         .clamp(SIDEBAR_MIN, SIDEBAR_MAX)
 }
-pub(crate) const AVATAR_SIZE: u32 = 40;
+pub(crate) const AVATAR_SIZE: u32 = 44;
 pub(crate) const AVATAR_RADIUS: f32 = AVATAR_SIZE as f32 / 2.0;
-pub(crate) const CHAT_ROW_PADDING: [u16; 2] = [8, 12];
+pub(crate) const CHAT_ROW_PADDING: [u16; 2] = [7, 9];
 pub(crate) const CHAT_ROW_RADIUS: f32 = 7.0;
-pub(crate) const CHAT_ROW_HEIGHT: u32 = 64;
-pub(crate) const SIDEBAR_INSET: u16 = 6;
+pub(crate) const CHAT_ROW_HEIGHT: u32 = 60;
+pub(crate) const SIDEBAR_INSET: u16 = 4;
 pub(crate) const BADGE_RADIUS: f32 = 10.0;
 pub(crate) const BADGE_PADDING: [u16; 2] = [2, 6];
 

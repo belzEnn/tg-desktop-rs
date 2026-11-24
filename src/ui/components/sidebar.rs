@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use super::{delivery_mark, time_label};
+
 use crate::ui::theme::{appearance, metrics as m, typography as ty};
 use crate::{app, domain::ChatSummary};
 use iced::{
@@ -9,7 +11,7 @@ use iced::{
 
 pub(in crate::ui) fn view(state: &app::State, width: f32) -> Element<'_, app::Message> {
     let forwarding = state.forward_selection().is_some();
-    let mut chats = column![].spacing(m::GAP_TINY).padding(m::SIDEBAR_INSET);
+    let mut chats = column![].padding(m::SIDEBAR_INSET);
     for chat in state.chats() {
         chats = chats.push(chat_row(state, chat, forwarding));
     }
@@ -30,7 +32,7 @@ fn chat_row<'a>(
     let initial = chat
         .title
         .chars()
-        .next()
+        .find(|character| !character.is_whitespace())
         .unwrap_or('?')
         .to_uppercase()
         .to_string();
@@ -52,30 +54,46 @@ fn chat_row<'a>(
     ]
     .align_y(iced::Alignment::Center)
     .spacing(m::GAP_INLINE);
-    if chat.unread_count > 0 {
-        heading = heading.push(
-            container(text(chat.unread_count.to_string()).size(ty::CAPTION))
-                .padding(m::BADGE_PADDING)
-                .style(appearance::badge),
-        );
+    if chat.last_message_is_outgoing
+        && let Some(mark) = chat
+            .last_message_id
+            .and_then(|id| delivery_mark(id, chat.last_read_outbox_message_id))
+    {
+        heading = heading.push(text(mark).size(ty::MESSAGE_METADATA).style(text::primary));
+    }
+    let enabled = destination.is_some() || selected;
+    if let Some(date) = chat.last_message_date {
+        let mut time = text(time_label(date)).size(ty::MESSAGE_METADATA);
+        if enabled {
+            time = time.style(appearance::muted_text);
+        }
+        heading = heading.push(time);
     }
     let mut preview = text(preview)
         .size(ty::PREVIEW)
         .width(Fill)
         .wrapping(text::Wrapping::None);
-    if destination.is_some() || selected {
+    if enabled {
         preview = preview.style(appearance::muted_text);
+    }
+    let mut details = row![container(preview).width(Fill).clip(true)]
+        .align_y(iced::Alignment::Center)
+        .spacing(m::GAP_INLINE);
+    if chat.unread_count > 0 {
+        details = details.push(
+            container(text(chat.unread_count.to_string()).size(ty::CAPTION))
+                .padding(m::BADGE_PADDING)
+                .style(appearance::badge),
+        );
     }
     button(
         row![
             container(text(initial).font(ty::HEADING_FONT))
                 .center(m::AVATAR_SIZE)
                 .style(appearance::avatar),
-            column![heading, container(preview).width(Fill).clip(true)]
-                .spacing(m::GAP_TINY)
-                .width(Fill),
+            column![heading, details].spacing(m::GAP_TINY).width(Fill),
         ]
-        .spacing(m::GAP_SECTION)
+        .spacing(m::GAP)
         .align_y(iced::Alignment::Center),
     )
     .padding(m::CHAT_ROW_PADDING)
