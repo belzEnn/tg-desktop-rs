@@ -29,6 +29,7 @@ pub(crate) const BADGE_PADDING: [u16; 2] = [2, 6];
 
 pub(crate) const CONVERSATION_PADDING: u16 = 12;
 pub(crate) const MESSAGE_PADDING: u16 = 10;
+pub(crate) const MESSAGE_MAX_WIDTH: u32 = 480;
 pub(crate) const QUOTE_PADDING: [u16; 2] = [4, 8];
 pub(crate) const COMPOSER_MIN_HEIGHT: u32 = 42;
 pub(crate) const COMPOSER_MAX_HEIGHT: u32 = 120;
