@@ -2,6 +2,8 @@
 
 mod components;
 mod theme;
+#[cfg(test)]
+mod visual;
 
 use crate::{app, config::ColorScheme, domain::AuthorizationState, tg::Adapter};
 use components::{composer, history, overlay, sidebar};

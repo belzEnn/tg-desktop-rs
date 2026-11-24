@@ -71,7 +71,9 @@ fn chat_row<'a>(
             container(text(initial).font(ty::HEADING_FONT))
                 .center(m::AVATAR_SIZE)
                 .style(appearance::avatar),
-            column![heading, preview].spacing(m::GAP_TINY).width(Fill),
+            column![heading, container(preview).width(Fill).clip(true)]
+                .spacing(m::GAP_TINY)
+                .width(Fill),
         ]
         .spacing(m::GAP_SECTION)
         .align_y(iced::Alignment::Center),

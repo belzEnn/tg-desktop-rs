@@ -241,19 +241,21 @@ pub(super) fn reply_preview<'a, Message: 'a>(
     sender: Option<&str>,
     snippet: impl iced::widget::text::IntoFragment<'a>,
 ) -> Element<'a, Message> {
-    let mut contents =
-        row![text("Reply to").size(ty::CAPTION).style(text::primary)].spacing(m::GAP_INLINE);
-    if let Some(sender) = sender {
-        contents = contents.push(text(format!("{sender}:")).size(ty::CAPTION));
-    }
-    contents = contents.push(
+    let label = sender.map_or(Cow::Borrowed("Reply"), |sender| {
+        Cow::Owned(format!("Reply to {sender}"))
+    });
+    let contents = column![
+        text(label)
+            .size(ty::CAPTION)
+            .style(text::primary)
+            .wrapping(text::Wrapping::None),
         text(snippet)
             .size(ty::CAPTION)
-            .width(iced::Length::Fill)
-            .wrapping(iced::widget::text::Wrapping::None),
-    );
-    container(contents)
-        .width(iced::Length::Fill)
+            .wrapping(text::Wrapping::None),
+    ]
+    .spacing(m::GAP_TINY);
+    container(container(contents).width(Fill).clip(true))
+        .width(Fill)
         .padding(m::QUOTE_PADDING)
         .style(appearance::quote)
         .into()
