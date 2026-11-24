@@ -1,5 +1,5 @@
 use super::message;
-use crate::ui::theme::{appearance, metrics as m};
+use crate::ui::theme::{appearance, colors, metrics as m};
 use crate::{
     app,
     domain::{ChatMessage, ChatSummary, MessageAddress},
@@ -11,7 +11,7 @@ use iced::{
         widget::{Id, Operation, Tree, operation, tree},
     },
     mouse,
-    widget::{column, scrollable, text},
+    widget::{center, column, container, scrollable, text},
     window,
 };
 
@@ -19,24 +19,27 @@ pub(in crate::ui) fn view<'a>(
     state: &'a app::State,
     open_chat: Option<&'a ChatSummary>,
 ) -> Element<'a, app::Message> {
+    let Some(chat) = open_chat else {
+        return center(text("Select a chat to view its messages.").style(appearance::muted_text))
+            .style(appearance::conversation)
+            .into();
+    };
+
     let mut history = column![]
         .spacing(m::GAP)
         .width(iced::Fill)
         .padding(m::CONVERSATION_PADDING);
-    if let Some(chat) = open_chat {
-        if state.history_loading() {
-            history = history.push(text("Loading messages…"));
-        } else if state.messages().is_empty() && state.history_error().is_none() {
-            history = history.push(text("No messages in this chat."));
-        }
-        if let Some(error) = state.history_error() {
-            history = history.push(text(error).style(appearance::error_text));
-        }
-        for message in state.messages() {
-            history = history.push(message::view(chat, message));
-        }
-    } else {
-        history = history.push(text("Select a chat to view its messages."));
+    if state.history_loading() {
+        history = history.push(text("Loading messages…").style(appearance::muted_text));
+    } else if state.messages().is_empty() && state.history_error().is_none() {
+        history = history.push(text("No messages in this chat.").style(appearance::muted_text));
+    }
+    if let Some(error) = state.history_error() {
+        history = history.push(text(error).style(appearance::error_text));
+    }
+    let link = colors::link(state.color_scheme());
+    for message in state.messages() {
+        history = history.push(message::view(chat, message, link));
     }
     let history = scrollable(history)
         .id(app::CHAT_HISTORY_SCROLL_ID)
@@ -45,17 +48,19 @@ pub(in crate::ui) fn view<'a>(
             content_height: viewport.content_bounds().height,
         })
         .height(iced::Length::Fill);
-    let read = open_chat.and_then(|chat| {
-        state.read_after(chat).map(|after| VisibleHistory {
-            chat_id: chat.id,
-            after,
-            messages: state.messages(),
-        })
+    let read = state.read_after(chat).map(|after| VisibleHistory {
+        chat_id: chat.id,
+        after,
+        messages: state.messages(),
     });
-    Element::new(History {
+    container(Element::new(History {
         content: history.into(),
         read,
-    })
+    }))
+    .width(iced::Fill)
+    .height(iced::Fill)
+    .style(appearance::conversation)
+    .into()
 }
 
 #[derive(Clone)]

@@ -13,6 +13,9 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
     let editing_pending = editing && state.mutation_pending();
     let composer = text_editor(state.composer())
         .id(app::CHAT_COMPOSER_ID)
+        .size(ty::BODY_SIZE)
+        .line_height(ty::MESSAGE_LINE_HEIGHT)
+        .style(appearance::composer)
         .placeholder("Write a message")
         .min_height(m::COMPOSER_MIN_HEIGHT)
         .max_height(m::COMPOSER_MAX_HEIGHT)
@@ -115,6 +118,7 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
         .align_y(iced::Alignment::End),
     );
     container(conversation.spacing(m::GAP))
+        .style(appearance::surface)
         .padding(m::CONVERSATION_PADDING)
         .width(Fill)
         .into()

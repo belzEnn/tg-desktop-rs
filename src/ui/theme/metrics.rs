@@ -1,4 +1,4 @@
-// Existing project sizes, in logical pixels.
+// Client-specific geometry in logical pixels.
 pub(crate) const GAP_TINY: u32 = 2;
 pub(crate) const GAP_COMPACT: u32 = 3;
 pub(crate) const GAP_SMALL: u32 = 4;
@@ -7,7 +7,6 @@ pub(crate) const GAP: u32 = 8;
 pub(crate) const GAP_SECTION: u32 = 12;
 pub(crate) const SIGN_IN_PADDING: u16 = 24;
 
-// Client window geometry in logical pixels.
 pub(crate) const WINDOW_SIZE: iced::Size = iced::Size::new(1024.0, 768.0);
 pub(crate) const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(680.0, 480.0);
 pub(crate) const HEADER_HEIGHT: u32 = 56;
@@ -24,12 +23,17 @@ pub(crate) fn sidebar_width(window_width: f32) -> f32 {
 pub(crate) const AVATAR_SIZE: u32 = 40;
 pub(crate) const AVATAR_RADIUS: f32 = AVATAR_SIZE as f32 / 2.0;
 pub(crate) const CHAT_ROW_PADDING: [u16; 2] = [8, 12];
-pub(crate) const CHAT_ROW_RADIUS: f32 = 6.0;
+pub(crate) const CHAT_ROW_RADIUS: f32 = 7.0;
+pub(crate) const CHAT_ROW_HEIGHT: u32 = 64;
+pub(crate) const SIDEBAR_INSET: u16 = 6;
+pub(crate) const BADGE_RADIUS: f32 = 10.0;
 pub(crate) const BADGE_PADDING: [u16; 2] = [2, 6];
 
 pub(crate) const CONVERSATION_PADDING: u16 = 12;
 pub(crate) const MESSAGE_PADDING: u16 = 10;
 pub(crate) const MESSAGE_MAX_WIDTH: u32 = 480;
+pub(crate) const BUBBLE_RADIUS: f32 = 12.0;
+pub(crate) const EDITOR_RADIUS: f32 = 8.0;
 pub(crate) const QUOTE_PADDING: [u16; 2] = [4, 8];
 pub(crate) const COMPOSER_MIN_HEIGHT: u32 = 42;
 pub(crate) const COMPOSER_MAX_HEIGHT: u32 = 120;
