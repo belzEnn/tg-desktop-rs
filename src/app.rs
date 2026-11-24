@@ -1773,6 +1773,8 @@ mod tests {
             id,
             title: "Chat".into(),
             last_message_id: Some(5),
+            last_message_date: Some(60),
+            last_message_is_outgoing: false,
             last_message_preview: "latest".into(),
             unread_count: 4,
             last_read_inbox_message_id: 1,

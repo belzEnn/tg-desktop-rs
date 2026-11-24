@@ -154,7 +154,9 @@ fn fixture(scheme: ColorScheme) -> app::State {
     .map(|(index, (title, preview, unread_count))| ChatSummary {
         id: index as i64 + 1,
         title: title.into(),
-        last_message_id: Some(6),
+        last_message_id: (index != 4).then_some(6),
+        last_message_date: (index != 4).then_some(1_761_819_600),
+        last_message_is_outgoing: index == 0,
         last_message_preview: preview.into(),
         unread_count,
         last_read_inbox_message_id: 6,

@@ -1,4 +1,4 @@
-use super::history::HistoryEvent;
+use super::{delivery_mark, history::HistoryEvent, time_label};
 use crate::domain::{
     ChatMessage, ChatSummary, MessageAddress, TextRun, TextStyle, conceal_spoilers, spoiler_mask,
 };
@@ -109,9 +109,8 @@ fn metadata<'a>(message: &ChatMessage, check: Option<&'static str>) -> Element<'
     }
     if message.date > 0 {
         // TDLib supplies Unix seconds. Use a consistent UTC clock.
-        let minutes = message.date / 60;
         labels = labels.push(
-            text(format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60))
+            text(time_label(message.date))
                 .size(ty::MESSAGE_METADATA)
                 .style(appearance::muted_text),
         );
@@ -246,15 +245,11 @@ fn message_span(fragment: &str, style: TextStyle, link_color: Color) -> text::Sp
 }
 
 fn outgoing_check_mark(message: &ChatMessage, read_through: Option<i64>) -> Option<&'static str> {
-    let read_through = read_through?;
-    if message.is_outgoing && message.can_reference && message.id > 0 {
-        return Some(if message.id <= read_through {
-            "✓✓"
-        } else {
-            "✓"
-        });
+    if message.is_outgoing && message.can_reference {
+        delivery_mark(message.id, read_through)
+    } else {
+        None
     }
-    None
 }
 
 pub(super) fn reply_preview<'a, Message: 'a>(

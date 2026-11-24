@@ -35,11 +35,16 @@ pub(super) fn chat(chat: &Chat, account_user_id: Option<i64>) -> Option<ChatSumm
         }
         _ => None,
     };
+    let last_message = chat.last_message.as_ref();
     Some(ChatSummary {
         id: chat.id,
         title: chat.title.clone(),
-        last_message_id: chat.last_message.as_ref().map(|message| message.id),
-        last_message_preview: chat.last_message.as_ref().map_or_else(
+        last_message_id: last_message.map(|message| message.id),
+        last_message_date: last_message
+            .map(|message| message.date)
+            .filter(|&date| date > 0),
+        last_message_is_outgoing: last_message.is_some_and(|message| message.is_outgoing),
+        last_message_preview: last_message.map_or_else(
             || "No messages yet".into(),
             |message| preview_text(&message.content).into_owned(),
         ),
