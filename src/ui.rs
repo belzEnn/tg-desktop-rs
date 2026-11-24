@@ -1,9 +1,13 @@
 // Iced window and user interface.
 
+mod theme;
+
 use std::borrow::Cow;
 
+use theme::{colors, metrics as m, typography as ty};
+
 use iced::{
-    Color, Element, Event, Fill, Font, Length, Point, Rectangle, Renderer, Size, Theme, Vector,
+    Element, Event, Fill, Font, Length, Point, Rectangle, Renderer, Size, Theme, Vector,
     advanced::{
         Clipboard, Layout, Shell, Widget, layout, renderer,
         widget::{Id, Operation, Tree, operation, tree},
@@ -36,7 +40,9 @@ pub fn run(backend: Adapter) -> iced::Result {
 }
 
 fn view(state: &app::State) -> Element<'_, app::Message> {
-    let mut content = column![text("Sign in to Telegram")].padding(24).spacing(12);
+    let mut content = column![text("Sign in to Telegram")]
+        .padding(m::SIGN_IN_PADDING)
+        .spacing(m::GAP_SECTION);
 
     match state.authorization_state() {
         Some(AuthorizationState::WaitPhoneNumber) => {
@@ -80,7 +86,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
         }
         Some(AuthorizationState::Ready) => {
             let forward_selection = state.forward_selection();
-            let mut chats = column![].spacing(2);
+            let mut chats = column![].spacing(m::GAP_TINY);
             for chat in state.chats() {
                 let preview = single_line_preview(&chat.last_message_preview);
                 let initial = chat
@@ -90,11 +96,11 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     .unwrap_or('?')
                     .to_uppercase()
                     .to_string();
-                let mut heading = row![text(&chat.title).width(Fill)].spacing(6);
+                let mut heading = row![text(&chat.title).width(Fill)].spacing(m::GAP_INLINE);
                 if chat.unread_count > 0 {
                     heading = heading.push(
-                        container(text(chat.unread_count.to_string()).size(12))
-                            .padding([2, 6])
+                        container(text(chat.unread_count.to_string()).size(ty::CAPTION))
+                            .padding(m::BADGE_PADDING)
                             .style(container::primary),
                     );
                 }
@@ -103,31 +109,29 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                         container(
                             row![
                                 container(text(initial))
-                                    .width(40)
-                                    .height(40)
-                                    .center(40)
+                                    .width(m::AVATAR_SIZE)
+                                    .height(m::AVATAR_SIZE)
+                                    .center(m::AVATAR_SIZE)
                                     .style(|_: &iced::Theme| iced::widget::container::Style {
-                                        background: Some(iced::Background::Color(
-                                            iced::Color::from_rgb(0.25, 0.42, 0.62,)
-                                        )),
-                                        border: iced::Border::default().rounded(20.0),
+                                        background: Some(iced::Background::Color(colors::AVATAR)),
+                                        border: iced::Border::default().rounded(m::AVATAR_RADIUS),
                                         ..Default::default()
                                     }),
                                 column![
                                     heading,
                                     text(preview)
-                                        .size(13)
+                                        .size(ty::PREVIEW)
                                         .width(iced::Length::Fill)
                                         .wrapping(iced::widget::text::Wrapping::None),
                                 ]
-                                .spacing(4)
+                                .spacing(m::GAP_SMALL)
                                 .width(iced::Length::Fill),
                             ]
-                            .spacing(12)
+                            .spacing(m::GAP_SECTION)
                             .align_y(iced::Alignment::Center),
                         )
                         .width(iced::Length::Fill)
-                        .padding([8, 12]),
+                        .padding(m::CHAT_ROW_PADDING),
                     )
                     .width(iced::Length::Fill)
                     .style(|theme: &iced::Theme, status| iced::widget::button::Style {
@@ -138,13 +142,13 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                                     theme.palette().text.r,
                                     theme.palette().text.g,
                                     theme.palette().text.b,
-                                    0.10,
+                                    colors::HOVER_ALPHA,
                                 )))
                             }
                             _ => None,
                         },
                         text_color: theme.palette().text,
-                        border: iced::Border::default().rounded(6.0),
+                        border: iced::Border::default().rounded(m::CHAT_ROW_RADIUS),
                         ..Default::default()
                     })
                     .on_press_maybe(if forward_selection.is_some() {
@@ -158,14 +162,14 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                 );
             }
             let sidebar = container(scrollable(chats).height(iced::Length::Fill))
-                .width(360)
+                .width(m::SIDEBAR_WIDTH)
                 .height(iced::Length::Fill);
             let open_chat = state
                 .open_chat_id()
                 .and_then(|id| state.chats().iter().find(|chat| chat.id == id));
-            let mut history = column![].spacing(8);
+            let mut history = column![].spacing(m::GAP);
             if let Some(chat) = open_chat {
-                history = history.push(text(&chat.title).size(20));
+                history = history.push(text(&chat.title).size(ty::CHAT_TITLE));
                 if state.history_loading() {
                     history = history.push(text("Loading messages…"));
                 } else if state.messages().is_empty() && state.history_error().is_none() {
@@ -175,23 +179,27 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     history = history.push(text(error));
                 }
                 for message in state.messages() {
-                    let sender = text(&message.sender_name).size(12);
+                    let sender = text(&message.sender_name).size(ty::CAPTION);
                     let check = outgoing_check_mark(message, chat.last_read_outbox_message_id);
                     let mut body = if message.is_edited || check.is_some() {
-                        let mut heading = row![sender].spacing(8).align_y(iced::Alignment::Center);
+                        let mut heading = row![sender]
+                            .spacing(m::GAP)
+                            .align_y(iced::Alignment::Center);
                         if message.is_edited {
-                            heading = heading.push(text("edited").size(12));
+                            heading = heading.push(text("edited").size(ty::CAPTION));
                         }
                         if let Some(check) = check {
-                            heading = heading.push(text(check).size(12).style(text::primary));
+                            heading =
+                                heading.push(text(check).size(ty::CAPTION).style(text::primary));
                         }
                         column![heading]
                     } else {
                         column![sender]
                     }
-                    .spacing(3);
+                    .spacing(m::GAP_COMPACT);
                     if let Some(origin) = &message.forwarded_from {
-                        body = body.push(text(format!("Forwarded from {origin}")).size(12));
+                        body =
+                            body.push(text(format!("Forwarded from {origin}")).size(ty::CAPTION));
                     }
                     if let Some(reply) = &message.reply {
                         let sender = reply
@@ -201,7 +209,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                         body = body.push(reply_preview(sender, reply.display_text()));
                     }
                     body = body.push(message_text(chat.id, message));
-                    let content = container(body).padding(10);
+                    let content = container(body).padding(m::MESSAGE_PADDING);
                     history = if message.can_reference {
                         history.push(mouse_area(content).on_right_press(HistoryEvent::OpenMenu {
                             chat_id: chat.id,
@@ -219,8 +227,8 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
             let composer = text_editor(state.composer())
                 .id(app::CHAT_COMPOSER_ID)
                 .placeholder("Write a message")
-                .min_height(42)
-                .max_height(120)
+                .min_height(m::COMPOSER_MIN_HEIGHT)
+                .max_height(m::COMPOSER_MAX_HEIGHT)
                 .on_action(app::Message::ComposerAction)
                 .key_binding(|press| {
                     if press.modified_key == Key::Named(Named::Enter) {
@@ -262,7 +270,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                                 "Forward message: {}",
                                 MessagePreview::message_snippet(&source.text, &source.text_runs)
                             ))
-                            .size(12),
+                            .size(ty::CAPTION),
                         );
                     }
                     let destination = selection
@@ -288,7 +296,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                             ),
                         ]
                         .align_y(iced::Alignment::Center)
-                        .spacing(8),
+                        .spacing(m::GAP),
                     );
                 }
                 if state.forward_pending() && forward_selection.is_none() {
@@ -316,7 +324,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                             ),
                         ]
                         .align_y(iced::Alignment::Center)
-                        .spacing(8),
+                        .spacing(m::GAP),
                     );
                 } else if let Some(original) = state.reply_message() {
                     let snippet =
@@ -327,7 +335,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                             button("Cancel reply").on_press(app::Message::CancelReply),
                         ]
                         .align_y(iced::Alignment::Center)
-                        .spacing(8),
+                        .spacing(m::GAP),
                     );
                 }
                 conversation = conversation.push(
@@ -336,7 +344,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                         button(if editing { "Save" } else { "Send" })
                             .on_press_maybe((!editing_pending).then_some(app::Message::Submit)),
                     ]
-                    .spacing(8)
+                    .spacing(m::GAP)
                     .align_y(iced::Alignment::End),
                 );
             }
@@ -353,7 +361,7 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                 .align_y(iced::Alignment::Center),
                 conversation,
             ]
-            .padding(12)
+            .padding(m::CONVERSATION_PADDING)
             .width(iced::Length::Fill)
             .height(iced::Length::Fill);
             let mut layers = stack![row![sidebar, chat_area].width(Fill).height(Fill)]
@@ -407,11 +415,6 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
     scrollable(content).into()
 }
 
-const MENU_WIDTH: f32 = 152.0;
-const MENU_ITEM_HEIGHT: f32 = 30.0;
-const MENU_PADDING: f32 = 6.0;
-const MENU_SPACING: f32 = 4.0;
-
 fn message_menu(
     menu: app::MessageMenu,
     can_reply: bool,
@@ -429,7 +432,7 @@ fn message_menu(
                 can_forward.then_some(app::Message::StartForward(menu.message_id))
             ),
         ]
-        .spacing(MENU_SPACING);
+        .spacing(m::MENU_SPACING);
         let mut item_count = 2;
         if menu.actions.can_edit {
             actions = actions.push(menu_button(
@@ -447,19 +450,19 @@ fn message_menu(
         }
         if menu.request_id.is_some() {
             actions = actions.push(
-                container(text("Checking actions…").size(12))
-                    .height(MENU_ITEM_HEIGHT)
-                    .center_y(MENU_ITEM_HEIGHT),
+                container(text("Checking actions…").size(ty::CAPTION))
+                    .height(m::MENU_ITEM_HEIGHT)
+                    .center_y(m::MENU_ITEM_HEIGHT),
             );
             item_count += 1;
         }
-        let height = MENU_PADDING * 2.0
-            + MENU_ITEM_HEIGHT * item_count as f32
-            + MENU_SPACING * (item_count - 1) as f32;
+        let height = m::MENU_PADDING * 2.0
+            + m::MENU_ITEM_HEIGHT * item_count as f32
+            + m::MENU_SPACING * (item_count - 1) as f32;
         let panel = container(actions)
-            .width(MENU_WIDTH)
+            .width(m::MENU_WIDTH)
             .height(height)
-            .padding(MENU_PADDING)
+            .padding(m::MENU_PADDING)
             .style(container::rounded_box);
         pin(opaque(panel))
             .position(menu_position(menu.position, available, height))
@@ -474,13 +477,15 @@ fn menu_button(
 ) -> iced::widget::Button<'static, app::Message> {
     button(label)
         .width(Fill)
-        .height(MENU_ITEM_HEIGHT)
+        .height(m::MENU_ITEM_HEIGHT)
         .on_press_maybe(action)
 }
 
 fn menu_position(cursor: Point, available: Size, height: f32) -> Point {
     Point::new(
-        cursor.x.clamp(0.0, (available.width - MENU_WIDTH).max(0.0)),
+        cursor
+            .x
+            .clamp(0.0, (available.width - m::MENU_WIDTH).max(0.0)),
         cursor.y.clamp(0.0, (available.height - height).max(0.0)),
     )
 }
@@ -494,7 +499,7 @@ fn delete_confirmation<'a>(
     let mut actions = row![
         button(if pending { "Close" } else { "Cancel" }).on_press(app::Message::CancelDelete),
     ]
-    .spacing(8);
+    .spacing(m::GAP);
     if confirmation.actions.can_delete_for_self {
         actions = actions.push(
             button("Delete for me")
@@ -519,15 +524,15 @@ fn delete_confirmation<'a>(
         } else {
             "Delete this message?"
         })
-        .size(18),
+        .size(ty::DIALOG_TITLE),
     ]
-    .spacing(12);
+    .spacing(m::GAP_SECTION);
     if let Some(original) = original {
         dialog = dialog.push(
             text(
                 MessagePreview::message_snippet(&original.text, &original.text_runs).into_string(),
             )
-            .size(13),
+            .size(ty::PREVIEW),
         );
     }
     dialog = dialog.push(actions);
@@ -535,7 +540,9 @@ fn delete_confirmation<'a>(
         dialog = dialog.push(text(error));
     }
     center(opaque(
-        container(dialog).padding(16).style(container::rounded_box),
+        container(dialog)
+            .padding(m::DIALOG_PADDING)
+            .style(container::rounded_box),
     ))
     .into()
 }
@@ -803,7 +810,7 @@ fn message_text(chat_id: i64, message: &ChatMessage) -> Element<'_, HistoryEvent
 
 fn spoiler_span(fragment: &str) -> text::Span<'_, (), Font> {
     span(spoiler_mask(fragment))
-        .background(Color::from_rgba(0.48, 0.50, 0.54, 0.24))
+        .background(colors::HIGHLIGHT)
         .link(())
 }
 
@@ -818,9 +825,9 @@ fn message_span(fragment: &str, style: TextStyle) -> text::Span<'_, (), Font> {
         .strikethrough(style.contains(TextStyle::STRIKETHROUGH));
     if bold || italic || monospace {
         let mut font = if monospace {
-            Font::MONOSPACE
+            ty::CODE_FONT
         } else {
-            Font::DEFAULT
+            ty::BODY_FONT
         };
         if bold {
             font.weight = font::Weight::Bold;
@@ -831,11 +838,10 @@ fn message_span(fragment: &str, style: TextStyle) -> text::Span<'_, (), Font> {
         segment = segment.font(font);
     }
     if monospace {
-        let opacity = if pre { 0.24 } else { 0.16 };
-        segment = segment.background(Color::from_rgba(0.48, 0.50, 0.54, opacity));
+        segment = segment.background(if pre { colors::HIGHLIGHT } else { colors::CODE });
     }
     if link {
-        segment = segment.color(Color::from_rgb(0.26, 0.47, 0.75));
+        segment = segment.color(colors::LINK);
     }
     segment
 }
@@ -856,19 +862,20 @@ fn reply_preview<'a, Message: 'a>(
     sender: Option<&str>,
     snippet: impl iced::widget::text::IntoFragment<'a>,
 ) -> Element<'a, Message> {
-    let mut contents = row![text("Reply to").size(12).style(text::primary)].spacing(6);
+    let mut contents =
+        row![text("Reply to").size(ty::CAPTION).style(text::primary)].spacing(m::GAP_INLINE);
     if let Some(sender) = sender {
-        contents = contents.push(text(format!("{sender}:")).size(12));
+        contents = contents.push(text(format!("{sender}:")).size(ty::CAPTION));
     }
     contents = contents.push(
         text(snippet)
-            .size(12)
+            .size(ty::CAPTION)
             .width(iced::Length::Fill)
             .wrapping(iced::widget::text::Wrapping::None),
     );
     container(contents)
         .width(iced::Length::Fill)
-        .padding([4, 8])
+        .padding(m::QUOTE_PADDING)
         .style(container::rounded_box)
         .into()
 }
