@@ -4,7 +4,7 @@ use crate::{app, domain::MessagePreview};
 use iced::{
     Element, Fill,
     keyboard::{Key, key::Named},
-    widget::{button, column, row, text, text_editor},
+    widget::{button, column, container, row, text, text_editor},
 };
 
 pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
@@ -114,5 +114,8 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
         .spacing(m::GAP)
         .align_y(iced::Alignment::End),
     );
-    conversation.into()
+    container(conversation.spacing(m::GAP))
+        .padding(m::CONVERSATION_PADDING)
+        .width(Fill)
+        .into()
 }

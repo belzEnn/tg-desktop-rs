@@ -7,7 +7,20 @@ pub(crate) const GAP: u32 = 8;
 pub(crate) const GAP_SECTION: u32 = 12;
 pub(crate) const SIGN_IN_PADDING: u16 = 24;
 
-pub(crate) const SIDEBAR_WIDTH: u32 = 360;
+// Client window geometry in logical pixels.
+pub(crate) const WINDOW_SIZE: iced::Size = iced::Size::new(1024.0, 768.0);
+pub(crate) const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(680.0, 480.0);
+pub(crate) const HEADER_HEIGHT: u32 = 56;
+pub(crate) const PANE_DIVIDER: u32 = 1;
+const SIDEBAR_FRACTION: f32 = 0.31;
+const SIDEBAR_MIN: f32 = 224.0;
+const SIDEBAR_MAX: f32 = 336.0;
+
+pub(crate) fn sidebar_width(window_width: f32) -> f32 {
+    (window_width * SIDEBAR_FRACTION)
+        .round()
+        .clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+}
 pub(crate) const AVATAR_SIZE: u32 = 40;
 pub(crate) const AVATAR_RADIUS: f32 = AVATAR_SIZE as f32 / 2.0;
 pub(crate) const CHAT_ROW_PADDING: [u16; 2] = [8, 12];

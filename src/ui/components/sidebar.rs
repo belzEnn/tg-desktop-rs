@@ -5,14 +5,14 @@ use iced::{
     widget::{button, column, container, row, scrollable, text},
 };
 
-pub(in crate::ui) fn sidebar(state: &app::State) -> Element<'_, app::Message> {
+pub(in crate::ui) fn view(state: &app::State, width: f32) -> Element<'_, app::Message> {
     let forwarding = state.forward_selection().is_some();
     let mut chats = column![].spacing(m::GAP_TINY);
     for chat in state.chats() {
         chats = chats.push(chat_row(state, chat, forwarding));
     }
     container(scrollable(chats).height(Length::Fill))
-        .width(m::SIDEBAR_WIDTH)
+        .width(width)
         .height(Length::Fill)
         .into()
 }
@@ -31,7 +31,8 @@ fn chat_row<'a>(
         .unwrap_or('?')
         .to_uppercase()
         .to_string();
-    let mut heading = row![text(&chat.title).width(Fill)].spacing(m::GAP_INLINE);
+    let mut heading =
+        row![text(&chat.title).width(Fill).wrapping(text::Wrapping::None)].spacing(m::GAP_INLINE);
     if chat.unread_count > 0 {
         heading = heading.push(
             container(text(chat.unread_count.to_string()).size(ty::CAPTION))
@@ -69,6 +70,7 @@ fn chat_row<'a>(
         .padding(m::CHAT_ROW_PADDING),
     )
     .width(iced::Length::Fill)
+    .clip(true)
     .style(move |theme, status| appearance::chat_button(theme, status, selected))
     .on_press_maybe(if forwarding {
         (chat.can_receive_forwards
