@@ -3,3 +3,6 @@ test_dc = true
 
 # Optional; defaults to the platform's local application data directory.
 # data_dir = "/path/to/tg-desktop-rs"
+
+# Optional startup color scheme. The in-window switch applies to the session.
+# theme = "light" # or "dark"

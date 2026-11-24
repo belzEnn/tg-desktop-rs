@@ -1,5 +1,5 @@
 use super::message;
-use crate::ui::theme::{metrics as m, typography as ty};
+use crate::ui::theme::{appearance, metrics as m, typography as ty};
 use crate::{
     app,
     domain::{ChatMessage, ChatSummary, MessageAddress},
@@ -28,7 +28,7 @@ pub(in crate::ui) fn view<'a>(
             history = history.push(text("No messages in this chat."));
         }
         if let Some(error) = state.history_error() {
-            history = history.push(text(error));
+            history = history.push(text(error).style(appearance::error_text));
         }
         for message in state.messages() {
             history = history.push(message::view(chat, message));

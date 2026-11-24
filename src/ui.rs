@@ -3,7 +3,7 @@
 mod components;
 mod theme;
 
-use crate::{app, domain::AuthorizationState, tg::Adapter};
+use crate::{app, config::ColorScheme, domain::AuthorizationState, tg::Adapter};
 use components::{composer, history, overlay, sidebar};
 use iced::{
     Element, Fill,
@@ -12,11 +12,17 @@ use iced::{
 use theme::metrics as m;
 
 /// Runs the application window.
-pub fn run(backend: Adapter) -> iced::Result {
-    iced::application(move || app::boot(backend.clone()), app::update, view)
-        .title(|_: &app::State| String::from("tg-desktop-rs"))
-        .subscription(app::subscription)
-        .run()
+pub fn run(backend: Adapter, scheme: ColorScheme) -> iced::Result {
+    iced::application(
+        move || app::boot(backend.clone(), scheme),
+        app::update,
+        view,
+    )
+    .title(|_: &app::State| String::from("tg-desktop-rs"))
+    .subscription(app::subscription)
+    .theme(|state: &app::State| theme::iced_theme(state.color_scheme()))
+    .default_font(theme::typography::BODY_FONT)
+    .run()
 }
 
 fn view(state: &app::State) -> Element<'_, app::Message> {
@@ -74,7 +80,8 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
             }
             let chat_area = column![
                 row![
-                    text("").width(iced::Length::Fill),
+                    space().width(Fill),
+                    theme_button(state.color_scheme()),
                     button(if state.logout_pending() {
                         "Logging out…"
                     } else {
@@ -82,7 +89,8 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
                     })
                     .on_press(app::Message::LogOut),
                 ]
-                .align_y(iced::Alignment::Center),
+                .align_y(iced::Alignment::Center)
+                .spacing(m::GAP),
                 conversation,
             ]
             .padding(m::CONVERSATION_PADDING)
@@ -137,8 +145,17 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
     }
 
     if let Some(error) = state.authorization_error() {
-        content = content.push(text(error));
+        content = content.push(text(error).style(theme::appearance::error_text));
     }
 
-    scrollable(content).into()
+    scrollable(content.push(theme_button(state.color_scheme()))).into()
+}
+
+fn theme_button<'a>(scheme: ColorScheme) -> iced::widget::Button<'a, app::Message> {
+    button(match scheme {
+        ColorScheme::Light => "Dark theme",
+        ColorScheme::Dark => "Light theme",
+    })
+    .style(button::secondary)
+    .on_press(app::Message::ToggleTheme)
 }

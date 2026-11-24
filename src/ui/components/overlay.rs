@@ -1,4 +1,4 @@
-use crate::ui::theme::{metrics as m, typography as ty};
+use crate::ui::theme::{appearance, metrics as m, typography as ty};
 use crate::{
     app,
     domain::{ChatMessage, DeleteScope, MessagePreview},
@@ -130,7 +130,7 @@ pub(in crate::ui) fn delete_confirmation<'a>(
     }
     dialog = dialog.push(actions);
     if let Some(error) = error {
-        dialog = dialog.push(text(error));
+        dialog = dialog.push(text(error).style(appearance::error_text));
     }
     center(opaque(
         container(dialog)

@@ -1,4 +1,4 @@
-use crate::ui::theme::{colors, metrics as m, typography as ty};
+use crate::ui::theme::{appearance, colors, metrics as m, typography as ty};
 use crate::{app, domain::ChatSummary};
 use iced::{
     Element, Fill, Length,
@@ -22,6 +22,7 @@ fn chat_row<'a>(
     chat: &'a ChatSummary,
     forwarding: bool,
 ) -> Element<'a, app::Message> {
+    let selected = state.open_chat_id() == Some(chat.id);
     let preview = single_line_preview(&chat.last_message_preview);
     let initial = chat
         .title
@@ -47,6 +48,7 @@ fn chat_row<'a>(
                     .center(m::AVATAR_SIZE)
                     .style(|_: &iced::Theme| iced::widget::container::Style {
                         background: Some(iced::Background::Color(colors::AVATAR)),
+                        text_color: Some(iced::Color::WHITE),
                         border: iced::Border::default().rounded(m::AVATAR_RADIUS),
                         ..Default::default()
                     }),
@@ -67,22 +69,7 @@ fn chat_row<'a>(
         .padding(m::CHAT_ROW_PADDING),
     )
     .width(iced::Length::Fill)
-    .style(|theme: &iced::Theme, status| iced::widget::button::Style {
-        background: match status {
-            iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed => {
-                Some(iced::Background::Color(iced::Color::from_rgba(
-                    theme.palette().text.r,
-                    theme.palette().text.g,
-                    theme.palette().text.b,
-                    colors::HOVER_ALPHA,
-                )))
-            }
-            _ => None,
-        },
-        text_color: theme.palette().text,
-        border: iced::Border::default().rounded(m::CHAT_ROW_RADIUS),
-        ..Default::default()
-    })
+    .style(move |theme, status| appearance::chat_button(theme, status, selected))
     .on_press_maybe(if forwarding {
         (chat.can_receive_forwards
             && !state.forward_pending()

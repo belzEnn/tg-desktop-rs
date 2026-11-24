@@ -31,6 +31,6 @@ async fn main() -> anyhow::Result<()> {
     let backend = tg::Adapter::new(config.use_test_dc(), credentials, data_dir)
         .context("failed to start Telegram backend")?;
 
-    ui::run(backend)?;
+    ui::run(backend, config.color_scheme())?;
     Ok(())
 }
