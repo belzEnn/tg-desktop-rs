@@ -101,7 +101,7 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
         let snippet = MessagePreview::message_snippet(&original.text, &original.text_runs);
         conversation = conversation.push(
             row![
-                reply_preview(Some(&original.sender_name), snippet.into_string()),
+                reply_preview(Some(&original.sender_name), snippet.into_string(), Fill),
                 button("Cancel reply").on_press(app::Message::CancelReply),
             ]
             .align_y(iced::Alignment::Center)
