@@ -54,16 +54,19 @@ fn chat_row<'a>(
     ]
     .align_y(iced::Alignment::Center)
     .spacing(m::GAP_INLINE);
-    if chat.last_message_is_outgoing
-        && let Some(mark) = chat
-            .last_message_id
-            .and_then(|id| delivery_mark(id, chat.last_read_outbox_message_id))
-    {
-        heading = heading.push(text(mark).size(ty::MESSAGE_METADATA).style(text::primary));
-    }
+    let mark = chat
+        .last_message_id
+        .filter(|_| chat.last_message_is_outgoing)
+        .and_then(|id| delivery_mark(id, chat.last_read_outbox_message_id));
     let enabled = destination.is_some() || selected;
-    if let Some(date) = chat.last_message_date {
-        let mut time = text(time_label(date)).size(ty::MESSAGE_METADATA);
+    if chat.last_message_date.is_some() || mark.is_some() {
+        let prefix = match mark {
+            Some("✓✓") => "✓✓ ",
+            Some(_) => "✓ ",
+            None => "",
+        };
+        let mut time =
+            text(time_label(chat.last_message_date, prefix, "")).size(ty::MESSAGE_METADATA);
         if enabled {
             time = time.style(appearance::muted_text);
         }
@@ -76,16 +79,20 @@ fn chat_row<'a>(
     if enabled {
         preview = preview.style(appearance::muted_text);
     }
-    let mut details = row![container(preview).width(Fill).clip(true)]
-        .align_y(iced::Alignment::Center)
-        .spacing(m::GAP_INLINE);
-    if chat.unread_count > 0 {
-        details = details.push(
+    let preview = container(preview).width(Fill).clip(true);
+    let details: Element<'_, _> = if chat.unread_count == 0 {
+        preview.into()
+    } else {
+        row![
+            preview,
             container(text(chat.unread_count.to_string()).size(ty::CAPTION))
                 .padding(m::BADGE_PADDING)
                 .style(appearance::badge),
-        );
-    }
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(m::GAP_INLINE)
+        .into()
+    };
     button(
         row![
             container(text(initial).font(ty::HEADING_FONT))

@@ -25,7 +25,10 @@ pub(in crate::ui) fn view<'a>(
             .into();
     };
 
-    let mut history = column![].width(iced::Fill).padding(m::CONVERSATION_PADDING);
+    let mut history = column![]
+        .width(iced::Fill)
+        .padding(m::CONVERSATION_PADDING)
+        .max_width(m::HISTORY_LANE_MAX_WIDTH);
     if state.history_loading() {
         history = history.push(text("Loading messages…").style(appearance::muted_text));
     } else if state.messages().is_empty() && state.history_error().is_none() {
@@ -44,12 +47,13 @@ pub(in crate::ui) fn view<'a>(
         previous = Some(message);
     }
     let history = scrollable(history)
+        .width(iced::Fill)
         .id(app::CHAT_HISTORY_SCROLL_ID)
         .on_scroll(|viewport| HistoryEvent::Scrolled {
             offset_y: viewport.absolute_offset().y,
             content_height: viewport.content_bounds().height,
         })
-        .height(iced::Length::Fill);
+        .height(iced::Shrink);
     let read = state.read_after(chat).map(|after| VisibleHistory {
         chat_id: chat.id,
         after,
@@ -61,6 +65,11 @@ pub(in crate::ui) fn view<'a>(
     }))
     .width(iced::Fill)
     .height(iced::Fill)
+    .align_y(if state.messages().is_empty() {
+        iced::alignment::Vertical::Top
+    } else {
+        iced::alignment::Vertical::Bottom
+    })
     .style(appearance::conversation)
     .into()
 }

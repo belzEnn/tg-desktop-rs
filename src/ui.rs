@@ -159,6 +159,7 @@ fn theme_button<'a>(scheme: ColorScheme) -> iced::widget::Button<'a, app::Messag
         ColorScheme::Light => "Dark theme",
         ColorScheme::Dark => "Light theme",
     })
-    .style(button::secondary)
+    .style(theme::appearance::toolbar_action)
+    .padding(m::ACTION_PADDING)
     .on_press(app::Message::ToggleTheme)
 }

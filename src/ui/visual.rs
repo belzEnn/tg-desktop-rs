@@ -27,6 +27,8 @@ use crate::{
 
 use super::{m, theme, view};
 
+const WIDE_SIZE: Size = Size::new(1920.0, 1024.0);
+
 #[test]
 fn workspace_fits_supported_sizes_and_keeps_history_and_composer_visible() {
     let mut state = fixture(ColorScheme::Light);
@@ -36,7 +38,7 @@ fn workspace_fits_supported_sizes_and_keeps_history_and_composer_visible() {
     let renderer = renderer();
     let mut element = view(&state);
     let mut tree = Tree::new(&element);
-    for size in [m::WINDOW_SIZE, m::MIN_WINDOW_SIZE, Size::new(1440.0, 900.0)] {
+    for size in [m::WINDOW_SIZE, m::MIN_WINDOW_SIZE, WIDE_SIZE] {
         let node =
             element
                 .as_widget_mut()
@@ -54,6 +56,11 @@ fn workspace_fits_supported_sizes_and_keeps_history_and_composer_visible() {
         assert_eq!(header.y + header.height, history.y);
         assert_eq!(history.y + history.height, composer.y);
         assert!(history.height > 0.0 && composer.height > 0.0);
+        let scrollable = conversation.child(1).child(0).bounds();
+        assert_eq!(scrollable.y + scrollable.height, composer.y);
+        if size == WIDE_SIZE {
+            assert!(scrollable.y > history.y);
+        }
         assert_eq!(composer.y + composer.height, size.height);
         assert_eq!(composer.x + composer.width, size.width);
     }
@@ -67,7 +74,11 @@ fn capture_visual_baseline() {
     create_dir_all(&directory).unwrap();
     for (label, scheme) in [("light", ColorScheme::Light), ("dark", ColorScheme::Dark)] {
         let state = fixture(scheme);
-        for (variant, size) in [("default", m::WINDOW_SIZE), ("minimum", m::MIN_WINDOW_SIZE)] {
+        for (variant, size) in [
+            ("default", m::WINDOW_SIZE),
+            ("minimum", m::MIN_WINDOW_SIZE),
+            ("wide", WIDE_SIZE),
+        ] {
             let path = directory.join(format!("{label}-{variant}.ppm"));
             capture(&path, &state, size).unwrap();
         }
@@ -154,9 +165,9 @@ fn fixture(scheme: ColorScheme) -> app::State {
     .map(|(index, (title, preview, unread_count))| ChatSummary {
         id: index as i64 + 1,
         title: title.into(),
-        last_message_id: (index != 4).then_some(6),
+        last_message_id: (index != 4).then_some(if index == 0 { 9 } else { 6 }),
         last_message_date: (index != 4).then_some(1_761_819_600),
-        last_message_is_outgoing: index == 0,
+        last_message_is_outgoing: index == 1,
         last_message_preview: preview.into(),
         unread_count,
         last_read_inbox_message_id: 6,
@@ -188,6 +199,9 @@ fn fixture(scheme: ColorScheme) -> app::State {
         message(4, "You", "I’ll bring a map and a thermos.", true),
         message(5, "Marta", "[Photo]", false),
         message(6, "You", "I’ll check the forecast in the morning.", true),
+        message(7, "Marta", "Sounds good.", false),
+        message(8, "Marta", "See you!", false),
+        message(9, "Marta", "I’ll text you when I leave.", false),
     ];
     messages[2].text_runs = Box::new([
         TextRun {

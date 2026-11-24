@@ -1,6 +1,5 @@
 // Client-specific geometry in logical pixels.
 pub(crate) const GAP_TINY: u32 = 2;
-pub(crate) const GAP_SMALL: u32 = 4;
 pub(crate) const GAP_INLINE: u32 = 6;
 pub(crate) const GAP: u32 = 8;
 pub(crate) const GAP_SECTION: u32 = 12;
@@ -8,11 +7,11 @@ pub(crate) const SIGN_IN_PADDING: u16 = 24;
 
 pub(crate) const WINDOW_SIZE: iced::Size = iced::Size::new(1024.0, 768.0);
 pub(crate) const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(680.0, 480.0);
-pub(crate) const HEADER_HEIGHT: u32 = 56;
+pub(crate) const HEADER_HEIGHT: u32 = 51;
 pub(crate) const PANE_DIVIDER: u32 = 1;
-const SIDEBAR_FRACTION: f32 = 0.31;
+const SIDEBAR_FRACTION: f32 = 0.34;
 const SIDEBAR_MIN: f32 = 224.0;
-const SIDEBAR_MAX: f32 = 336.0;
+const SIDEBAR_MAX: f32 = 640.0;
 
 pub(crate) fn sidebar_width(window_width: f32) -> f32 {
     (window_width * SIDEBAR_FRACTION)
@@ -33,10 +32,14 @@ pub(crate) const MESSAGE_PADDING: [u16; 2] = [5, 9];
 pub(crate) const MESSAGE_GAP: u32 = 5;
 pub(crate) const MESSAGE_GROUP_GAP: u32 = 2;
 pub(crate) const MESSAGE_MAX_WIDTH: u32 = 480;
+pub(crate) const HISTORY_LANE_MAX_WIDTH: u32 = 880;
 pub(crate) const BUBBLE_RADIUS: f32 = 12.0;
 pub(crate) const EDITOR_RADIUS: f32 = 8.0;
 pub(crate) const QUOTE_PADDING: [u16; 2] = [4, 8];
-pub(crate) const COMPOSER_MIN_HEIGHT: u32 = 42;
+pub(crate) const COMPOSER_MIN_HEIGHT: u32 = 24;
+pub(crate) const COMPOSER_PADDING: [u16; 2] = [5, 12];
+pub(crate) const EDITOR_PADDING: [u16; 2] = [6, 8];
+pub(crate) const ACTION_PADDING: [u16; 2] = [6, 10];
 pub(crate) const COMPOSER_MAX_HEIGHT: u32 = 120;
 
 pub(crate) const MENU_WIDTH: f32 = 152.0;
