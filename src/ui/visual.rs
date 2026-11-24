@@ -35,6 +35,11 @@ fn workspace_fits_supported_sizes_and_keeps_history_and_composer_visible() {
     drop(app::update(&mut state, app::Message::ToggleTheme));
     assert!(matches!(state.color_scheme(), ColorScheme::Dark));
 
+    let outgoing_index = state
+        .messages()
+        .iter()
+        .rposition(|message| message.is_outgoing)
+        .expect("fixture contains outgoing messages");
     let renderer = renderer();
     let mut element = view(&state);
     let mut tree = Tree::new(&element);
@@ -56,7 +61,14 @@ fn workspace_fits_supported_sizes_and_keeps_history_and_composer_visible() {
         assert_eq!(header.y + header.height, history.y);
         assert_eq!(history.y + history.height, composer.y);
         assert!(history.height > 0.0 && composer.height > 0.0);
-        let scrollable = conversation.child(1).child(0).bounds();
+        let scrollable = conversation.child(1).child(0);
+        let outgoing = scrollable.child(0).child(outgoing_index).child(0).bounds();
+        assert_eq!(
+            outgoing.x + outgoing.width + f32::from(m::CONVERSATION_PADDING),
+            history.x + history.width,
+        );
+        assert!(outgoing.width <= m::MESSAGE_MAX_WIDTH as f32);
+        let scrollable = scrollable.bounds();
         assert_eq!(scrollable.y + scrollable.height, composer.y);
         if size == WIDE_SIZE {
             assert!(scrollable.y > history.y);
