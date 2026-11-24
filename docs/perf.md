@@ -160,3 +160,31 @@ builds masked fragments only for concealed spoilers.
 RSS after login, after opening a 50-message chat, and after one idle hour
 remains pending, along with rendering and live edit verification on
 Telegram's test DC.
+
+## Phase 6.5 — UI Foundation
+
+Five paired synthetic runs compared the production views at `97d68fe` and
+Phase 6.5, with 50 dialogs and 50 text messages, a 1024 × 768 viewport, and
+the tiny-skia renderer. Each run used a fresh debug test process on the same
+machine. After one warm-up, the probe rebuilt the view and recorded draw
+primitives 50 times using the same widget tree. It then rasterized one
+frame and read Linux `VmRSS`.
+
+| Metric | Before | Phase 6.5 |
+| --- | ---: | ---: |
+| Median layout and draw preparation per iteration | 0.652 ms | 0.773 ms |
+| Median process RSS after one rasterized frame | 18,692 KiB | 18,928 KiB |
+| Per-run preparation averages (ms) | 0.652 / 0.660 / 0.650 / 0.641 / 0.655 | 0.770 / 0.795 / 0.773 / 0.781 / 0.768 |
+| Per-run RSS (KiB) | 18,784 / 18,692 / 18,664 / 18,676 / 18,916 | 19,176 / 18,888 / 18,928 / 18,768 / 19,224 |
+
+The new view added 0.121 ms and 236 KiB to these medians. These debug,
+offscreen measurements exclude GPU or compositor presentation, the Telegram
+worker, idle behavior, and interactive input. The earlier release window
+probe measured a different workload.
+
+The message rows borrow the open history and introduce no media buffers or
+row cache. They build rows for the loaded history and use widget layout
+bounds for read tracking. The UI adds no recurring subscription. A display
+connection and an authenticated test session were unavailable. RSS after
+login, opening a 50-message chat, and one idle hour, plus scroll and resize
+latency, remain pending.

@@ -111,6 +111,17 @@ measurements.
   `code`, `pre`, links and click-to-reveal spoilers. Hide spoilers in previews.
   Test-DC verification and RSS measurements pending.
 
+### Phase 6.5: UI Foundation
+
+- ✅ Shared color, typography, spacing, and geometry tokens.
+- ✅ Reusable dialog, header, history, message, composer, and overlay views.
+- ✅ Light and dark themes with a session switch and a startup TOML setting.
+- ✅ Resizable split layout with a bounded sidebar and independent history viewport.
+- ✅ Variable-height message rows with separate content, reply, forward, and metadata rendering.
+- ✅ Styled chat surfaces and interaction states informed by Telegram Desktop.
+- ✅ [Headless visual baseline](docs/ui-visual-baseline.md) and resize checks.
+- ☐ Compare captures with Telegram Desktop, verify the test-DC flows, and record authenticated RSS.
+
 ## 7. Scrolling at scale
 
 - **7.1 Virtualized message list.** ☐ Only visible rows are built and drawn;

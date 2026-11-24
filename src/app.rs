@@ -1541,6 +1541,20 @@ impl State {
 }
 
 #[cfg(test)]
+pub(crate) fn visual_fixture(
+    scheme: crate::config::ColorScheme,
+    chats: Vec<ChatSummary>,
+    messages: Vec<ChatMessage>,
+) -> State {
+    let (mut state, _) = boot(Adapter::for_tests(), scheme);
+    state.authorization_state = Some(AuthorizationState::Ready);
+    state.open_chat_id = chats.first().map(|chat| chat.id);
+    state.chats = chats;
+    state.messages = messages;
+    state
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
