@@ -188,3 +188,19 @@ bounds for read tracking. The UI adds no recurring subscription. A display
 connection and an authenticated test session were unavailable. RSS after
 login, opening a 50-message chat, and one idle hour, plus scroll and resize
 latency, remain pending.
+
+### Phase 6.5 — compact layout follow-up
+
+Seven paired runs on the same headless debug workload compared the prior
+Phase 6.5 baseline (`2d9fbf1`) with the compact layout. The new dialog rows
+display last-message metadata. The layout can also show more messages in
+the same viewport.
+
+| Metric | Before | Compact layout |
+| --- | ---: | ---: |
+| Median view, layout, and draw preparation per iteration | 0.762 ms | 0.813 ms |
+| Median RSS after one rasterized frame | 19,004 KiB | 19,236 KiB |
+
+The deltas were 0.051 ms and 232 KiB. These measurements cover a 1024 × 768
+viewport and fixed synthetic data. Native scrolling and resizing latency
+and the authenticated RSS scenarios remain pending.

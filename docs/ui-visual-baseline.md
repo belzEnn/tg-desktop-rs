@@ -1,13 +1,14 @@
 # UI visual baseline
 
 The fixture renders the production view with iced 0.14 and tiny-skia using an
-in-memory adapter. The five dialogs and six messages are fixed. They exercise
+in-memory adapter. The five dialogs and nine messages are fixed. They exercise
 the active dialog, unread counts, a long title, multiline text, formatted text,
-a reply, a forwarded placeholder, an edit label, and outgoing read receipts.
+a reply, a forwarded placeholder, an edit label, outgoing read receipts,
+and a run of consecutive short messages.
 
 | Setting | Baseline |
 | --- | --- |
-| Content viewport | 1024 × 768 px and 680 × 480 px |
+| Content viewport | 680 × 480 px, 1024 × 768 px, and 1920 × 1024 px |
 | Scale | 1.0 (100%, with one physical pixel per logical pixel) |
 | Theme | Light and dark |
 | Font | iced default sans-serif and the system font configuration |
@@ -25,7 +26,7 @@ UI_BASELINE_DIR=/tmp/tg-desktop-rs-baseline \
   cargo test ui::visual::capture_visual_baseline -- --ignored --exact
 ```
 
-The test writes four PPM files outside Git. ImageMagick can convert them to PNG.
+The test writes six PPM files outside Git. ImageMagick can convert them to PNG.
 
 ```sh
 for shot in /tmp/tg-desktop-rs-baseline/*.ppm; do
@@ -37,7 +38,7 @@ For a subsequent change, use separate output directories and the same toolchain,
 fonts, and renderer. Compare each matching screenshot visually or generate a
 difference image with `magick compare before.ppm after.ppm diff.png`. The regular
 test suite checks that the sidebar, header, history, and composer fit at the
-minimum, default, and 1440 × 900 window sizes. Screenshot generation is opt-in.
+minimum, default, and 1920 × 1024 window sizes. Screenshot generation is opt-in.
 Pixel comparisons have no automated pass or fail threshold.
 
 ## Compare with Telegram Desktop
@@ -58,8 +59,11 @@ phase used the following sources as references for those layout and style roles.
 - [Message layout and content](https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/SourceFiles/history/view/history_view_message.cpp)
 - [Embedded Day and Night themes](https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/SourceFiles/window/themes/window_themes_embedded.cpp)
 
-Token values are specific to this client. The captured baseline covers the
-client's offscreen output. A side-by-side run with Telegram Desktop and live
+The latest pass compares these synthetic captures with the supplied light and
+dark screenshots at desktop size. The compact rows use inline metadata when
+it fits. The short history ends above the composer, while the message lane
+has a width limit on wider windows. Token values are specific to this client.
+The captured baseline covers the client's offscreen output. A side-by-side run with Telegram Desktop and live
 input, resizing, and test-DC flows remain to be verified.
 
 ## Extending message rendering

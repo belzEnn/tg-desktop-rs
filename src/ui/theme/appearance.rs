@@ -101,7 +101,11 @@ pub(in crate::ui) fn bubble(theme: &Theme, outgoing: bool) -> container::Style {
             colors::DARK_OUTGOING,
         ))
     } else {
-        surface(theme)
+        container::Style::default().background(shade(
+            theme,
+            colors::LIGHT_SURFACE,
+            colors::DARK_INCOMING,
+        ))
     };
     style.border(Border::default().rounded(metrics::BUBBLE_RADIUS))
 }
@@ -112,12 +116,31 @@ pub(in crate::ui) fn quote(theme: &Theme) -> container::Style {
         .border(Border::default().rounded(metrics::CHAT_ROW_RADIUS))
 }
 
+pub(in crate::ui) fn toolbar_action(theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(theme.palette().text.scale_alpha(colors::HOVER_ALPHA).into())
+            }
+            _ => None,
+        },
+        text_color: if status == button::Status::Disabled {
+            theme.palette().text.scale_alpha(colors::DISABLED_ALPHA)
+        } else {
+            theme.palette().primary
+        },
+        border: Border::default().rounded(metrics::CHAT_ROW_RADIUS),
+        ..button::Style::default()
+    }
+}
+
 pub(in crate::ui) fn composer(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
     let mut style = text_editor::default(theme, status);
+    style.background = shade(theme, colors::LIGHT_SURFACE, colors::DARK_SURFACE).into();
     style.border.radius = metrics::EDITOR_RADIUS.into();
     style.placeholder = shade(theme, colors::LIGHT_MUTED, colors::DARK_MUTED);
-    if matches!(status, text_editor::Status::Active) {
-        style.border.color = border_color(theme);
+    if !matches!(status, text_editor::Status::Focused { .. }) {
+        style.border.width = 0.0;
     }
     style
 }

@@ -17,6 +17,7 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
         .line_height(ty::MESSAGE_LINE_HEIGHT)
         .style(appearance::composer)
         .placeholder("Write a message")
+        .padding(m::EDITOR_PADDING)
         .min_height(m::COMPOSER_MIN_HEIGHT)
         .max_height(m::COMPOSER_MAX_HEIGHT)
         .on_action(app::Message::ComposerAction)
@@ -112,14 +113,16 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
         row![
             composer,
             button(if editing { "Save" } else { "Send" })
+                .style(appearance::toolbar_action)
+                .padding(m::ACTION_PADDING)
                 .on_press_maybe((!editing_pending).then_some(app::Message::Submit)),
         ]
         .spacing(m::GAP)
-        .align_y(iced::Alignment::End),
+        .align_y(iced::Alignment::Center),
     );
     container(conversation.spacing(m::GAP))
         .style(appearance::surface)
-        .padding(m::CONVERSATION_PADDING)
+        .padding(m::COMPOSER_PADDING)
         .width(Fill)
         .into()
 }

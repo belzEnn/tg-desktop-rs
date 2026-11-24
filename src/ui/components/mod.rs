@@ -35,7 +35,8 @@ pub(super) fn chat_header<'a>(
             } else {
                 "Log out"
             })
-            .style(button::secondary)
+            .style(appearance::toolbar_action)
+            .padding(m::ACTION_PADDING)
             .on_press_maybe((!logout_pending).then_some(app::Message::LogOut)),
         ]
         .align_y(iced::Alignment::Center)
@@ -49,9 +50,20 @@ pub(super) fn chat_header<'a>(
     .into()
 }
 
-fn time_label(unix_seconds: i32) -> String {
-    let minutes = unix_seconds / 60;
-    format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60)
+fn time_label(unix_seconds: Option<i32>, prefix: &str, suffix: &str) -> String {
+    if let Some(seconds) = unix_seconds {
+        // TDLib supplies Unix seconds. Both surfaces use UTC.
+        let minutes = seconds / 60;
+        format!(
+            "{prefix}{:02}:{:02}{suffix}",
+            minutes / 60 % 24,
+            minutes % 60
+        )
+    } else {
+        format!("{} {}", prefix.trim_end(), suffix.trim_start())
+            .trim()
+            .to_owned()
+    }
 }
 
 fn delivery_mark(message_id: i64, read_through: Option<i64>) -> Option<&'static str> {

@@ -99,26 +99,17 @@ pub(super) fn view<'a>(
 }
 
 fn metadata<'a>(message: &ChatMessage, check: Option<&'static str>) -> Element<'a, HistoryEvent> {
-    let mut labels = row![].spacing(m::GAP_SMALL);
-    if message.is_edited {
-        labels = labels.push(
-            text("edited")
-                .size(ty::MESSAGE_METADATA)
-                .style(appearance::muted_text),
-        );
-    }
-    if message.date > 0 {
-        // TDLib supplies Unix seconds. Use a consistent UTC clock.
-        labels = labels.push(
-            text(time_label(message.date))
-                .size(ty::MESSAGE_METADATA)
-                .style(appearance::muted_text),
-        );
-    }
-    if let Some(check) = check {
-        labels = labels.push(text(check).size(ty::MESSAGE_METADATA).style(text::primary));
-    }
-    labels.into()
+    let prefix = if message.is_edited { "edited " } else { "" };
+    let suffix = match check {
+        Some("✓✓") => " ✓✓",
+        Some(_) => " ✓",
+        None => "",
+    };
+    let date = (message.date > 0).then_some(message.date);
+    text(time_label(date, prefix, suffix))
+        .size(ty::MESSAGE_METADATA)
+        .style(appearance::muted_text)
+        .into()
 }
 
 // Match displayable content here. A future media view can reuse the row,
