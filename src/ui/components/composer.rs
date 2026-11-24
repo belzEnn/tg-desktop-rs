@@ -1,5 +1,5 @@
 use super::message::reply_preview;
-use crate::ui::theme::{metrics as m, typography as ty};
+use crate::ui::theme::{appearance, metrics as m, typography as ty};
 use crate::{app, domain::MessagePreview};
 use iced::{
     Element, Fill,
@@ -30,7 +30,7 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
         });
     let mut conversation = column![];
     if let Some(error) = state.send_error() {
-        conversation = conversation.push(text(error));
+        conversation = conversation.push(text(error).style(appearance::error_text));
     }
     if let Some(selection) = forward_selection {
         if let Some(source) = state.forward_message() {
@@ -77,7 +77,7 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
     if state.delete_confirmation().is_none()
         && let Some(error) = state.message_action_error()
     {
-        conversation = conversation.push(text(error));
+        conversation = conversation.push(text(error).style(appearance::error_text));
     }
     if editing {
         conversation = conversation.push(

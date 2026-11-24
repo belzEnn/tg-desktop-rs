@@ -27,6 +27,7 @@ pub(crate) const CHAT_COMPOSER_ID: &str = "chat-composer";
 
 /// State owned by the application's update loop.
 pub(crate) struct State {
+    color_scheme: crate::config::ColorScheme,
     backend: Adapter,
     authorization_state: Option<AuthorizationState>,
     phone: String,
@@ -110,6 +111,7 @@ pub(crate) struct ForwardSelection {
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     BackendEvent(BackendEvent),
+    ToggleTheme,
     Initialized(Result<(), AdapterCommandError>),
     PhoneChanged(String),
     CodeChanged(String),
@@ -172,8 +174,12 @@ pub(crate) enum Message {
 }
 
 /// Creates application state and starts the backend through an iced task.
-pub(crate) fn boot(backend: Adapter) -> (State, Task<Message>) {
+pub(crate) fn boot(
+    backend: Adapter,
+    color_scheme: crate::config::ColorScheme,
+) -> (State, Task<Message>) {
     let state = State {
+        color_scheme,
         backend: backend.clone(),
         authorization_state: None,
         phone: String::new(),
@@ -257,6 +263,13 @@ fn message_menu_event(event: Event, status: event::Status, _: window::Id) -> Opt
 /// Applies backend events and command results to application state.
 pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
+        Message::ToggleTheme => {
+            use crate::config::ColorScheme;
+            state.color_scheme = match state.color_scheme {
+                ColorScheme::Light => ColorScheme::Dark,
+                ColorScheme::Dark => ColorScheme::Light,
+            };
+        }
         Message::BackendEvent(BackendEvent::AuthorizationChanged(authorization_state)) => {
             if authorization_state == AuthorizationState::Closed {
                 state.authorization_state = None;
@@ -1403,6 +1416,9 @@ fn current_unix_timestamp() -> i32 {
 }
 
 impl State {
+    pub(crate) fn color_scheme(&self) -> crate::config::ColorScheme {
+        self.color_scheme
+    }
     pub(crate) fn authorization_state(&self) -> Option<AuthorizationState> {
         self.authorization_state
     }
@@ -1658,7 +1674,7 @@ mod tests {
     }
 
     fn conversation_with_own_message(actions: MessageActions) -> State {
-        let (mut state, _) = boot(Adapter::for_tests());
+        let (mut state, _) = boot(Adapter::for_tests(), Default::default());
         state.open_chat_id = Some(10);
         let mut own = message(1);
         own.is_outgoing = true;
@@ -1753,7 +1769,7 @@ mod tests {
     }
 
     fn unread_conversation() -> State {
-        let (mut state, _) = boot(Adapter::for_tests());
+        let (mut state, _) = boot(Adapter::for_tests(), Default::default());
         state.authorization_state = Some(AuthorizationState::Ready);
         state.open_chat_id = Some(10);
         state.chats.push(unread_chat(10));
@@ -1883,7 +1899,7 @@ mod tests {
 
     #[test]
     fn live_content_updates_replace_styles_even_when_text_is_unchanged() {
-        let (mut state, _) = boot(Adapter::for_tests());
+        let (mut state, _) = boot(Adapter::for_tests(), Default::default());
         state.open_chat_id = Some(10);
         let mut original = message(1);
         original.text = "unchanged".into();
@@ -1920,7 +1936,7 @@ mod tests {
 
     #[test]
     fn revealing_a_spoiler_keeps_previews_masked_and_an_edit_hides_it_again() {
-        let (mut state, _) = boot(Adapter::for_tests());
+        let (mut state, _) = boot(Adapter::for_tests(), Default::default());
         state.open_chat_id = Some(10);
         let mut chat = unread_chat(10);
         chat.last_message_id = Some(1);

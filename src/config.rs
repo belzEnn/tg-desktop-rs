@@ -11,6 +11,17 @@ pub struct Config {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_dc: bool,
+    #[serde(default)]
+    theme: ColorScheme,
+}
+
+/// Initial UI color scheme.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ColorScheme {
+    #[default]
+    Light,
+    Dark,
 }
 
 /// Errors that can occur while loading configuration or resolving paths.
@@ -66,6 +77,10 @@ impl Config {
     /// Returns whether TDLib should connect to Telegram's test environment.
     pub fn use_test_dc(&self) -> bool {
         self.test_dc
+    }
+
+    pub(crate) fn color_scheme(&self) -> ColorScheme {
+        self.theme
     }
 
     /// Reads Telegram application credentials from the process environment.
