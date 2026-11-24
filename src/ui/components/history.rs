@@ -1,5 +1,5 @@
 use super::message;
-use crate::ui::theme::{appearance, metrics as m, typography as ty};
+use crate::ui::theme::{appearance, metrics as m};
 use crate::{
     app,
     domain::{ChatMessage, ChatSummary, MessageAddress},
@@ -19,9 +19,11 @@ pub(in crate::ui) fn view<'a>(
     state: &'a app::State,
     open_chat: Option<&'a ChatSummary>,
 ) -> Element<'a, app::Message> {
-    let mut history = column![].spacing(m::GAP);
+    let mut history = column![]
+        .spacing(m::GAP)
+        .width(iced::Fill)
+        .padding(m::CONVERSATION_PADDING);
     if let Some(chat) = open_chat {
-        history = history.push(text(&chat.title).size(ty::CHAT_TITLE));
         if state.history_loading() {
             history = history.push(text("Loading messages…"));
         } else if state.messages().is_empty() && state.history_error().is_none() {
@@ -101,7 +103,7 @@ impl VisibleHistory<'_> {
         viewport: Rectangle,
         scroll_y: f32,
     ) -> Option<MessageAddress> {
-        // History appends one layout child per message after the header/status rows.
+        // History appends one layout child per message after any status rows.
         let first_message = content.children().len().checked_sub(self.messages.len())?;
         let row_bottom = |index| {
             let row = content.child(first_message + index).bounds();

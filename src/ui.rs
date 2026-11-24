@@ -7,7 +7,11 @@ use crate::{app, config::ColorScheme, domain::AuthorizationState, tg::Adapter};
 use components::{composer, history, overlay, sidebar};
 use iced::{
     Element, Fill,
-    widget::{button, column, mouse_area, opaque, row, scrollable, space, stack, text, text_input},
+    widget::{
+        button, column, mouse_area, opaque, responsive, row, rule, scrollable, space, stack, text,
+        text_input,
+    },
+    window,
 };
 use theme::metrics as m;
 
@@ -19,13 +23,73 @@ pub fn run(backend: Adapter, scheme: ColorScheme) -> iced::Result {
         view,
     )
     .title(|_: &app::State| String::from("tg-desktop-rs"))
+    .window(window::Settings {
+        size: m::WINDOW_SIZE,
+        min_size: Some(m::MIN_WINDOW_SIZE),
+        ..window::Settings::default()
+    })
     .subscription(app::subscription)
     .theme(|state: &app::State| theme::iced_theme(state.color_scheme()))
     .default_font(theme::typography::BODY_FONT)
     .run()
 }
 
+fn workspace(state: &app::State) -> Element<'_, app::Message> {
+    let open_chat = state
+        .open_chat_id()
+        .and_then(|id| state.chats().iter().find(|chat| chat.id == id));
+    let main = responsive(move |available| {
+        let mut conversation = column![
+            components::chat_header(state, open_chat),
+            history::view(state, open_chat),
+        ];
+        if open_chat.is_some() {
+            conversation = conversation.push(composer::view(state));
+        }
+        row![
+            sidebar::view(state, m::sidebar_width(available.width)),
+            rule::vertical(m::PANE_DIVIDER),
+            conversation.width(Fill).height(Fill),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into()
+    });
+    let mut layers = stack![main].width(Fill).height(Fill);
+    if let Some(confirmation) = state.delete_confirmation() {
+        layers = layers
+            .push(opaque(
+                mouse_area(space().width(Fill).height(Fill)).on_press(app::Message::CancelDelete),
+            ))
+            .push(overlay::delete_confirmation(
+                confirmation,
+                state
+                    .messages()
+                    .iter()
+                    .find(|message| message.id == confirmation.message_id),
+                state.mutation_pending(),
+                state.message_action_error(),
+            ));
+    } else if let Some(menu) = state.message_menu() {
+        layers = layers
+            .push(
+                mouse_area(space().width(Fill).height(Fill))
+                    .on_press(app::Message::DismissMessageMenu),
+            )
+            .push(overlay::message_menu(
+                menu,
+                !state.is_editing(),
+                !state.forward_pending(),
+                !state.is_editing() && !state.mutation_pending(),
+            ));
+    }
+    layers.into()
+}
+
 fn view(state: &app::State) -> Element<'_, app::Message> {
+    if state.authorization_state() == Some(AuthorizationState::Ready) {
+        return workspace(state);
+    }
     let mut content = column![text("Sign in to Telegram")]
         .padding(m::SIGN_IN_PADDING)
         .spacing(m::GAP_SECTION);
@@ -69,69 +133,6 @@ fn view(state: &app::State) -> Element<'_, app::Message> {
             content = content.push(text(
                 "Initializing Telegram. The login form will appear when ready.",
             ));
-        }
-        Some(AuthorizationState::Ready) => {
-            let open_chat = state
-                .open_chat_id()
-                .and_then(|id| state.chats().iter().find(|chat| chat.id == id));
-            let mut conversation = column![history::view(state, open_chat)];
-            if open_chat.is_some() {
-                conversation = conversation.push(composer::view(state));
-            }
-            let chat_area = column![
-                row![
-                    space().width(Fill),
-                    theme_button(state.color_scheme()),
-                    button(if state.logout_pending() {
-                        "Logging out…"
-                    } else {
-                        "Log out"
-                    })
-                    .on_press(app::Message::LogOut),
-                ]
-                .align_y(iced::Alignment::Center)
-                .spacing(m::GAP),
-                conversation,
-            ]
-            .padding(m::CONVERSATION_PADDING)
-            .width(iced::Length::Fill)
-            .height(iced::Length::Fill);
-            let mut layers = stack![
-                row![sidebar::sidebar(state), chat_area]
-                    .width(Fill)
-                    .height(Fill)
-            ]
-            .width(Fill)
-            .height(Fill);
-            if let Some(confirmation) = state.delete_confirmation() {
-                layers = layers
-                    .push(opaque(
-                        mouse_area(space().width(Fill).height(Fill))
-                            .on_press(app::Message::CancelDelete),
-                    ))
-                    .push(overlay::delete_confirmation(
-                        confirmation,
-                        state
-                            .messages()
-                            .iter()
-                            .find(|message| message.id == confirmation.message_id),
-                        state.mutation_pending(),
-                        state.message_action_error(),
-                    ));
-            } else if let Some(menu) = state.message_menu() {
-                layers = layers
-                    .push(
-                        mouse_area(space().width(Fill).height(Fill))
-                            .on_press(app::Message::DismissMessageMenu),
-                    )
-                    .push(overlay::message_menu(
-                        menu,
-                        !state.is_editing(),
-                        !state.forward_pending(),
-                        !state.is_editing() && !state.mutation_pending(),
-                    ));
-            }
-            return layers.into();
         }
         Some(AuthorizationState::Closed) => {
             content = content.push(text("Telegram connection closed"));
