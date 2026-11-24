@@ -28,10 +28,10 @@ pub(crate) const BADGE_RADIUS: f32 = 10.0;
 pub(crate) const BADGE_PADDING: [u16; 2] = [2, 6];
 
 pub(crate) const CONVERSATION_PADDING: u16 = 12;
-pub(crate) const MESSAGE_PADDING: [u16; 2] = [5, 9];
+pub(crate) const MESSAGE_PADDING: [u16; 2] = [8, 11];
 pub(crate) const MESSAGE_GAP: u32 = 5;
 pub(crate) const MESSAGE_GROUP_GAP: u32 = 2;
-pub(crate) const MESSAGE_MAX_WIDTH: u32 = 480;
+pub(crate) const MESSAGE_MAX_WIDTH: u32 = 430;
 pub(crate) const BUBBLE_RADIUS: f32 = 12.0;
 pub(crate) const EDITOR_RADIUS: f32 = 8.0;
 pub(crate) const QUOTE_PADDING: [u16; 2] = [4, 8];

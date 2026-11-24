@@ -63,7 +63,9 @@ The latest pass compares these synthetic captures with the supplied light and
 dark screenshots at desktop size. The compact rows use inline metadata when
 it fits. The short history ends above the composer. The history fills the
 conversation pane, and each message bubble has a maximum width. Token values
-are specific to this client.
+are specific to this client. The message width cap and padding follow the
+reference chat style. This client uses 15 logical pixels for the message
+body and 13 for timestamps.
 The captured baseline covers the client's offscreen output. A side-by-side run with Telegram Desktop and live
 input, resizing, and test-DC flows remain to be verified.
 

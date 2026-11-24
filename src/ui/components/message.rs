@@ -133,6 +133,7 @@ impl<'a> Content<'a> {
             } => message_text(address, text, runs, spoilers_revealed, link),
             Self::Placeholder(label) => text(label)
                 .size(ty::MESSAGE_SIZE)
+                .line_height(ty::MESSAGE_LINE_HEIGHT)
                 .style(appearance::muted_text)
                 .wrapping(text::Wrapping::WordOrGlyph)
                 .into(),
