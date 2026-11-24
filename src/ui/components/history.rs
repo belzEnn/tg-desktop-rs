@@ -25,10 +25,7 @@ pub(in crate::ui) fn view<'a>(
             .into();
     };
 
-    let mut history = column![]
-        .width(iced::Fill)
-        .padding(m::CONVERSATION_PADDING)
-        .max_width(m::HISTORY_LANE_MAX_WIDTH);
+    let mut history = column![].width(iced::Fill).padding(m::CONVERSATION_PADDING);
     if state.history_loading() {
         history = history.push(text("Loading messages…").style(appearance::muted_text));
     } else if state.messages().is_empty() && state.history_error().is_none() {

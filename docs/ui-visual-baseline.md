@@ -61,8 +61,9 @@ phase used the following sources as references for those layout and style roles.
 
 The latest pass compares these synthetic captures with the supplied light and
 dark screenshots at desktop size. The compact rows use inline metadata when
-it fits. The short history ends above the composer, while the message lane
-has a width limit on wider windows. Token values are specific to this client.
+it fits. The short history ends above the composer. The history fills the
+conversation pane, and each message bubble has a maximum width. Token values
+are specific to this client.
 The captured baseline covers the client's offscreen output. A side-by-side run with Telegram Desktop and live
 input, resizing, and test-DC flows remain to be verified.
 
