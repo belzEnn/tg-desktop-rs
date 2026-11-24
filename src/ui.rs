@@ -48,7 +48,7 @@ fn workspace(state: &app::State) -> Element<'_, app::Message> {
         }
         row![
             sidebar::view(state, m::sidebar_width(available.width)),
-            rule::vertical(m::PANE_DIVIDER),
+            rule::vertical(m::PANE_DIVIDER).style(theme::appearance::divider),
             conversation.width(Fill).height(Fill),
         ]
         .width(Fill)

@@ -2,16 +2,20 @@ use super::history::HistoryEvent;
 use crate::domain::{
     ChatMessage, ChatSummary, MessageAddress, TextRun, TextStyle, conceal_spoilers, spoiler_mask,
 };
-use crate::ui::theme::{colors, metrics as m, typography as ty};
+use crate::ui::theme::{appearance, colors, metrics as m, typography as ty};
 use iced::{
-    Element, Fill, Font,
+    Color, Element, Fill, Font,
     alignment::Horizontal,
     font,
     widget::{column, container, mouse_area, rich_text, row, span, text},
 };
 use std::borrow::Cow;
 
-pub(super) fn view<'a>(chat: &ChatSummary, message: &'a ChatMessage) -> Element<'a, HistoryEvent> {
+pub(super) fn view<'a>(
+    chat: &ChatSummary,
+    message: &'a ChatMessage,
+    link: Color,
+) -> Element<'a, HistoryEvent> {
     let address = MessageAddress {
         chat_id: chat.id,
         message_id: message.id,
@@ -25,9 +29,18 @@ pub(super) fn view<'a>(chat: &ChatSummary, message: &'a ChatMessage) -> Element<
     } else {
         Content::Placeholder(&message.text)
     };
-    let mut body = column![text(&message.sender_name).size(ty::CAPTION)].spacing(m::GAP_COMPACT);
+    let mut body = column![
+        text(&message.sender_name)
+            .size(ty::CAPTION)
+            .font(ty::HEADING_FONT)
+    ]
+    .spacing(m::GAP_COMPACT);
     if let Some(origin) = &message.forwarded_from {
-        body = body.push(text(format!("Forwarded from {origin}")).size(ty::CAPTION));
+        body = body.push(
+            text(format!("Forwarded from {origin}"))
+                .size(ty::CAPTION)
+                .style(appearance::muted_text),
+        );
     }
     if let Some(reply) = &message.reply {
         let sender = reply
@@ -36,12 +49,14 @@ pub(super) fn view<'a>(chat: &ChatSummary, message: &'a ChatMessage) -> Element<
             .and_then(|preview| preview.sender_name.as_deref());
         body = body.push(reply_preview(sender, reply.display_text()));
     }
-    body = body.push(content.view(address));
+    body = body.push(content.view(address, link));
     let check = outgoing_check_mark(message, chat.last_read_outbox_message_id);
     if message.date > 0 || message.is_edited || check.is_some() {
         body = body.push(metadata(message, check));
     }
+    let outgoing = message.is_outgoing;
     let bubble = container(body)
+        .style(move |theme| appearance::bubble(theme, outgoing))
         .padding(m::MESSAGE_PADDING)
         .max_width(m::MESSAGE_MAX_WIDTH);
     let bubble = if message.can_reference {
@@ -54,7 +69,7 @@ pub(super) fn view<'a>(chat: &ChatSummary, message: &'a ChatMessage) -> Element<
     } else {
         Element::from(bubble)
     };
-    let alignment = if message.is_outgoing {
+    let alignment = if outgoing {
         Horizontal::Right
     } else {
         Horizontal::Left
@@ -66,13 +81,20 @@ pub(super) fn view<'a>(chat: &ChatSummary, message: &'a ChatMessage) -> Element<
 fn metadata<'a>(message: &ChatMessage, check: Option<&'static str>) -> Element<'a, HistoryEvent> {
     let mut labels = row![].spacing(m::GAP_SMALL);
     if message.is_edited {
-        labels = labels.push(text("edited").size(ty::CAPTION));
+        labels = labels.push(
+            text("edited")
+                .size(ty::CAPTION)
+                .style(appearance::muted_text),
+        );
     }
     if message.date > 0 {
         // TDLib supplies Unix seconds. Use a consistent UTC clock.
         let minutes = message.date / 60;
-        labels = labels
-            .push(text(format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60)).size(ty::CAPTION));
+        labels = labels.push(
+            text(format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60))
+                .size(ty::CAPTION)
+                .style(appearance::muted_text),
+        );
     }
     if let Some(check) = check {
         labels = labels.push(text(check).size(ty::CAPTION).style(text::primary));
@@ -92,14 +114,18 @@ enum Content<'a> {
 }
 
 impl<'a> Content<'a> {
-    fn view(self, address: MessageAddress) -> Element<'a, HistoryEvent> {
+    fn view(self, address: MessageAddress, link: Color) -> Element<'a, HistoryEvent> {
         match self {
             Self::Text {
                 text,
                 runs,
                 spoilers_revealed,
-            } => message_text(address, text, runs, spoilers_revealed),
-            Self::Placeholder(label) => text(label).wrapping(text::Wrapping::WordOrGlyph).into(),
+            } => message_text(address, text, runs, spoilers_revealed, link),
+            Self::Placeholder(label) => text(label)
+                .size(ty::BODY_SIZE)
+                .style(appearance::muted_text)
+                .wrapping(text::Wrapping::WordOrGlyph)
+                .into(),
         }
     }
 }
@@ -109,6 +135,7 @@ fn message_text<'a>(
     text_value: &'a str,
     runs: &'a [TextRun],
     spoilers_revealed: bool,
+    link: Color,
 ) -> Element<'a, HistoryEvent> {
     let plain = || {
         let content = if spoilers_revealed {
@@ -120,7 +147,11 @@ fn message_text<'a>(
             Cow::Borrowed(fragment) => text(fragment),
             Cow::Owned(fragment) => text(fragment),
         };
-        widget.wrapping(text::Wrapping::WordOrGlyph).into()
+        widget
+            .size(ty::BODY_SIZE)
+            .line_height(ty::MESSAGE_LINE_HEIGHT)
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .into()
     };
     if runs.is_empty() {
         return plain();
@@ -137,14 +168,17 @@ fn message_text<'a>(
             hidden = true;
             spans.push(spoiler_span(fragment));
         } else {
-            spans.push(message_span(fragment, run.style));
+            spans.push(message_span(fragment, run.style, link));
         }
         start = run.end;
     }
     if start != text_value.len() {
         return plain();
     }
-    let rich = rich_text(spans).wrapping(text::Wrapping::WordOrGlyph);
+    let rich = rich_text(spans)
+        .size(ty::BODY_SIZE)
+        .line_height(ty::MESSAGE_LINE_HEIGHT)
+        .wrapping(text::Wrapping::WordOrGlyph);
     if hidden {
         rich.on_link_click(move |()| HistoryEvent::RevealSpoilers(address))
             .into()
@@ -159,7 +193,7 @@ fn spoiler_span(fragment: &str) -> text::Span<'_, (), Font> {
         .link(())
 }
 
-fn message_span(fragment: &str, style: TextStyle) -> text::Span<'_, (), Font> {
+fn message_span(fragment: &str, style: TextStyle, link_color: Color) -> text::Span<'_, (), Font> {
     let bold = style.contains(TextStyle::BOLD);
     let italic = style.contains(TextStyle::ITALIC);
     let pre = style.contains(TextStyle::PRE);
@@ -186,7 +220,7 @@ fn message_span(fragment: &str, style: TextStyle) -> text::Span<'_, (), Font> {
         segment = segment.background(if pre { colors::HIGHLIGHT } else { colors::CODE });
     }
     if link {
-        segment = segment.color(colors::LINK);
+        segment = segment.color(link_color);
     }
     segment
 }
@@ -221,7 +255,7 @@ pub(super) fn reply_preview<'a, Message: 'a>(
     container(contents)
         .width(iced::Length::Fill)
         .padding(m::QUOTE_PADDING)
-        .style(container::rounded_box)
+        .style(appearance::quote)
         .into()
 }
 
@@ -263,7 +297,11 @@ mod tests {
 
     #[test]
     fn span_keeps_preformatted_whitespace_and_combines_visual_styles() {
-        let formatted = message_span("a\n  b", TextStyle::PRE.union(TextStyle::BOLD));
+        let formatted = message_span(
+            "a\n  b",
+            TextStyle::PRE.union(TextStyle::BOLD),
+            Color::BLACK,
+        );
         let font = formatted.font.unwrap();
         assert_eq!(font.family, Font::MONOSPACE.family);
         assert_eq!(font.weight, font::Weight::Bold);
@@ -275,6 +313,7 @@ mod tests {
             TextStyle::LINK
                 .union(TextStyle::ITALIC)
                 .union(TextStyle::STRIKETHROUGH),
+            Color::BLACK,
         );
         assert!(link.underline && link.strikethrough && link.color.is_some());
         assert_eq!(link.font.unwrap().style, font::Style::Italic);
@@ -312,6 +351,7 @@ mod tests {
             &message.text,
             &message.text_runs,
             message.spoilers_revealed,
+            Color::BLACK,
         );
         let renderer = Renderer::new(Font::default(), Pixels(16.0));
         let mut tree = Tree::new(&content);

@@ -11,7 +11,7 @@ use iced::{
 
 use crate::{app, domain::ChatSummary};
 
-use super::theme::{metrics as m, typography as ty};
+use super::theme::{appearance, metrics as m, typography as ty};
 
 pub(super) fn chat_header<'a>(
     state: &app::State,
@@ -24,6 +24,7 @@ pub(super) fn chat_header<'a>(
             container(
                 text(title)
                     .size(ty::CHAT_TITLE)
+                    .font(ty::HEADING_FONT)
                     .wrapping(text::Wrapping::None)
             )
             .width(Fill)
@@ -42,6 +43,7 @@ pub(super) fn chat_header<'a>(
     )
     .width(Fill)
     .height(m::HEADER_HEIGHT)
+    .style(appearance::surface)
     .align_y(iced::Alignment::Center)
     .padding([0, m::CONVERSATION_PADDING])
     .into()
