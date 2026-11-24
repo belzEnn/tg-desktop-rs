@@ -1,32 +1,31 @@
 use super::history::HistoryEvent;
 use crate::domain::{
-    ChatMessage, ChatSummary, MessageAddress, TextStyle, conceal_spoilers, spoiler_mask,
+    ChatMessage, ChatSummary, MessageAddress, TextRun, TextStyle, conceal_spoilers, spoiler_mask,
 };
 use crate::ui::theme::{colors, metrics as m, typography as ty};
 use iced::{
-    Element, Font, font,
+    Element, Fill, Font,
+    alignment::Horizontal,
+    font,
     widget::{column, container, mouse_area, rich_text, row, span, text},
 };
 use std::borrow::Cow;
 
 pub(super) fn view<'a>(chat: &ChatSummary, message: &'a ChatMessage) -> Element<'a, HistoryEvent> {
-    let sender = text(&message.sender_name).size(ty::CAPTION);
-    let check = outgoing_check_mark(message, chat.last_read_outbox_message_id);
-    let mut body = if message.is_edited || check.is_some() {
-        let mut heading = row![sender]
-            .spacing(m::GAP)
-            .align_y(iced::Alignment::Center);
-        if message.is_edited {
-            heading = heading.push(text("edited").size(ty::CAPTION));
+    let address = MessageAddress {
+        chat_id: chat.id,
+        message_id: message.id,
+    };
+    let content = if message.is_text {
+        Content::Text {
+            text: &message.text,
+            runs: &message.text_runs,
+            spoilers_revealed: message.spoilers_revealed,
         }
-        if let Some(check) = check {
-            heading = heading.push(text(check).size(ty::CAPTION).style(text::primary));
-        }
-        column![heading]
     } else {
-        column![sender]
-    }
-    .spacing(m::GAP_COMPACT);
+        Content::Placeholder(&message.text)
+    };
+    let mut body = column![text(&message.sender_name).size(ty::CAPTION)].spacing(m::GAP_COMPACT);
     if let Some(origin) = &message.forwarded_from {
         body = body.push(text(format!("Forwarded from {origin}")).size(ty::CAPTION));
     }
@@ -37,45 +36,104 @@ pub(super) fn view<'a>(chat: &ChatSummary, message: &'a ChatMessage) -> Element<
             .and_then(|preview| preview.sender_name.as_deref());
         body = body.push(reply_preview(sender, reply.display_text()));
     }
-    body = body.push(message_text(chat.id, message));
-    let content = container(body).padding(m::MESSAGE_PADDING);
-    if message.can_reference {
-        mouse_area(content)
+    body = body.push(content.view(address));
+    let check = outgoing_check_mark(message, chat.last_read_outbox_message_id);
+    if message.date > 0 || message.is_edited || check.is_some() {
+        body = body.push(metadata(message, check));
+    }
+    let bubble = container(body)
+        .padding(m::MESSAGE_PADDING)
+        .max_width(m::MESSAGE_MAX_WIDTH);
+    let bubble = if message.can_reference {
+        mouse_area(bubble)
             .on_right_press(HistoryEvent::OpenMenu {
-                chat_id: chat.id,
-                message_id: message.id,
+                chat_id: address.chat_id,
+                message_id: address.message_id,
             })
             .into()
     } else {
-        content.into()
+        Element::from(bubble)
+    };
+    let alignment = if message.is_outgoing {
+        Horizontal::Right
+    } else {
+        Horizontal::Left
+    };
+    // Each message owns one variable-height child in the history column.
+    container(bubble).width(Fill).align_x(alignment).into()
+}
+
+fn metadata<'a>(message: &ChatMessage, check: Option<&'static str>) -> Element<'a, HistoryEvent> {
+    let mut labels = row![].spacing(m::GAP_SMALL);
+    if message.is_edited {
+        labels = labels.push(text("edited").size(ty::CAPTION));
+    }
+    if message.date > 0 {
+        // TDLib supplies Unix seconds. Use a consistent UTC clock.
+        let minutes = message.date / 60;
+        labels = labels
+            .push(text(format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60)).size(ty::CAPTION));
+    }
+    if let Some(check) = check {
+        labels = labels.push(text(check).size(ty::CAPTION).style(text::primary));
+    }
+    labels.into()
+}
+
+// Match displayable content here. A future media view can reuse the row,
+// interaction and metadata once the domain exposes its data.
+enum Content<'a> {
+    Text {
+        text: &'a str,
+        runs: &'a [TextRun],
+        spoilers_revealed: bool,
+    },
+    Placeholder(&'a str),
+}
+
+impl<'a> Content<'a> {
+    fn view(self, address: MessageAddress) -> Element<'a, HistoryEvent> {
+        match self {
+            Self::Text {
+                text,
+                runs,
+                spoilers_revealed,
+            } => message_text(address, text, runs, spoilers_revealed),
+            Self::Placeholder(label) => text(label).wrapping(text::Wrapping::WordOrGlyph).into(),
+        }
     }
 }
 
-fn message_text(chat_id: i64, message: &ChatMessage) -> Element<'_, HistoryEvent> {
+fn message_text<'a>(
+    address: MessageAddress,
+    text_value: &'a str,
+    runs: &'a [TextRun],
+    spoilers_revealed: bool,
+) -> Element<'a, HistoryEvent> {
     let plain = || {
-        let content = if message.spoilers_revealed {
-            Cow::Borrowed(message.text.as_str())
+        let content = if spoilers_revealed {
+            Cow::Borrowed(text_value)
         } else {
-            conceal_spoilers(&message.text, &message.text_runs)
+            conceal_spoilers(text_value, runs)
         };
         let widget = match content {
             Cow::Borrowed(fragment) => text(fragment),
             Cow::Owned(fragment) => text(fragment),
         };
-        widget.wrapping(text::Wrapping::Word).into()
+        widget.wrapping(text::Wrapping::WordOrGlyph).into()
     };
-    if message.text_runs.is_empty() {
+    if runs.is_empty() {
         return plain();
     }
 
     let mut start = 0;
-    let mut spans = Vec::with_capacity(message.text_runs.len());
+    let mut spans = Vec::with_capacity(runs.len());
     let mut hidden = false;
-    for run in &message.text_runs {
-        let Some(fragment) = message.text.get(start..run.end) else {
+    for run in runs {
+        let Some(fragment) = text_value.get(start..run.end) else {
             return plain();
         };
-        if !message.spoilers_revealed && run.style.contains(TextStyle::SPOILER) {
+        if !spoilers_revealed && run.style.contains(TextStyle::SPOILER) {
             hidden = true;
             spans.push(spoiler_span(fragment));
         } else {
@@ -83,18 +141,13 @@ fn message_text(chat_id: i64, message: &ChatMessage) -> Element<'_, HistoryEvent
         }
         start = run.end;
     }
-    if start != message.text.len() {
+    if start != text_value.len() {
         return plain();
     }
-    let rich = rich_text(spans).wrapping(text::Wrapping::Word);
+    let rich = rich_text(spans).wrapping(text::Wrapping::WordOrGlyph);
     if hidden {
-        rich.on_link_click(move |()| {
-            HistoryEvent::RevealSpoilers(MessageAddress {
-                chat_id,
-                message_id: message.id,
-            })
-        })
-        .into()
+        rich.on_link_click(move |()| HistoryEvent::RevealSpoilers(address))
+            .into()
     } else {
         rich.into()
     }
@@ -251,7 +304,15 @@ mod tests {
             reply: None,
             forwarded_from: None,
         };
-        let mut content = message_text(17, &message);
+        let mut content = message_text(
+            MessageAddress {
+                chat_id: 17,
+                message_id: message.id,
+            },
+            &message.text,
+            &message.text_runs,
+            message.spoilers_revealed,
+        );
         let renderer = Renderer::new(Font::default(), Pixels(16.0));
         let mut tree = Tree::new(&content);
         let size = Size::new(320.0, 100.0);
