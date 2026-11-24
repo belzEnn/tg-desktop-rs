@@ -15,6 +15,7 @@ pub(super) fn view<'a>(
     chat: &ChatSummary,
     message: &'a ChatMessage,
     link: Color,
+    grouped: bool,
 ) -> Element<'a, HistoryEvent> {
     let address = MessageAddress {
         chat_id: chat.id,
@@ -29,12 +30,15 @@ pub(super) fn view<'a>(
     } else {
         Content::Placeholder(&message.text)
     };
-    let mut body = column![
-        text(&message.sender_name)
-            .size(ty::CAPTION)
-            .font(ty::HEADING_FONT)
-    ]
-    .spacing(m::GAP_COMPACT);
+    let outgoing = message.is_outgoing;
+    let mut body = column![].spacing(m::GAP_TINY);
+    if !outgoing && chat.last_read_outbox_message_id.is_none() && !message.sender_name.is_empty() {
+        body = body.push(
+            text(&message.sender_name)
+                .size(ty::CAPTION)
+                .font(ty::HEADING_FONT),
+        );
+    }
     if let Some(origin) = &message.forwarded_from {
         body = body.push(
             text(format!("Forwarded from {origin}"))
@@ -47,14 +51,21 @@ pub(super) fn view<'a>(
             .preview
             .as_ref()
             .and_then(|preview| preview.sender_name.as_deref());
-        body = body.push(reply_preview(sender, reply.display_text()));
+        body = body.push(reply_preview(sender, reply.display_text(), iced::Shrink));
     }
-    body = body.push(content.view(address, link));
+    let content = content.view(address, link);
     let check = outgoing_check_mark(message, chat.last_read_outbox_message_id);
     if message.date > 0 || message.is_edited || check.is_some() {
-        body = body.push(metadata(message, check));
+        body = body.push(
+            row![content, metadata(message, check)]
+                .spacing(m::GAP_INLINE)
+                .align_y(iced::alignment::Vertical::Bottom)
+                .wrap()
+                .vertical_spacing(m::GAP_TINY),
+        );
+    } else {
+        body = body.push(content);
     }
-    let outgoing = message.is_outgoing;
     let bubble = container(body)
         .style(move |theme| appearance::bubble(theme, outgoing))
         .padding(m::MESSAGE_PADDING)
@@ -75,7 +86,16 @@ pub(super) fn view<'a>(
         Horizontal::Left
     };
     // Each message owns one variable-height child in the history column.
-    container(bubble).width(Fill).align_x(alignment).into()
+    let gap = if grouped {
+        m::MESSAGE_GROUP_GAP
+    } else {
+        m::MESSAGE_GAP
+    };
+    container(bubble)
+        .padding(iced::Padding::ZERO.top(gap))
+        .width(Fill)
+        .align_x(alignment)
+        .into()
 }
 
 fn metadata<'a>(message: &ChatMessage, check: Option<&'static str>) -> Element<'a, HistoryEvent> {
@@ -83,7 +103,7 @@ fn metadata<'a>(message: &ChatMessage, check: Option<&'static str>) -> Element<'
     if message.is_edited {
         labels = labels.push(
             text("edited")
-                .size(ty::CAPTION)
+                .size(ty::MESSAGE_METADATA)
                 .style(appearance::muted_text),
         );
     }
@@ -92,12 +112,12 @@ fn metadata<'a>(message: &ChatMessage, check: Option<&'static str>) -> Element<'
         let minutes = message.date / 60;
         labels = labels.push(
             text(format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60))
-                .size(ty::CAPTION)
+                .size(ty::MESSAGE_METADATA)
                 .style(appearance::muted_text),
         );
     }
     if let Some(check) = check {
-        labels = labels.push(text(check).size(ty::CAPTION).style(text::primary));
+        labels = labels.push(text(check).size(ty::MESSAGE_METADATA).style(text::primary));
     }
     labels.into()
 }
@@ -122,7 +142,7 @@ impl<'a> Content<'a> {
                 spoilers_revealed,
             } => message_text(address, text, runs, spoilers_revealed, link),
             Self::Placeholder(label) => text(label)
-                .size(ty::BODY_SIZE)
+                .size(ty::MESSAGE_SIZE)
                 .style(appearance::muted_text)
                 .wrapping(text::Wrapping::WordOrGlyph)
                 .into(),
@@ -148,7 +168,7 @@ fn message_text<'a>(
             Cow::Owned(fragment) => text(fragment),
         };
         widget
-            .size(ty::BODY_SIZE)
+            .size(ty::MESSAGE_SIZE)
             .line_height(ty::MESSAGE_LINE_HEIGHT)
             .wrapping(text::Wrapping::WordOrGlyph)
             .into()
@@ -176,7 +196,7 @@ fn message_text<'a>(
         return plain();
     }
     let rich = rich_text(spans)
-        .size(ty::BODY_SIZE)
+        .size(ty::MESSAGE_SIZE)
         .line_height(ty::MESSAGE_LINE_HEIGHT)
         .wrapping(text::Wrapping::WordOrGlyph);
     if hidden {
@@ -240,6 +260,7 @@ fn outgoing_check_mark(message: &ChatMessage, read_through: Option<i64>) -> Opti
 pub(super) fn reply_preview<'a, Message: 'a>(
     sender: Option<&str>,
     snippet: impl iced::widget::text::IntoFragment<'a>,
+    width: iced::Length,
 ) -> Element<'a, Message> {
     let label = sender.map_or(Cow::Borrowed("Reply"), |sender| {
         Cow::Owned(format!("Reply to {sender}"))
@@ -254,8 +275,8 @@ pub(super) fn reply_preview<'a, Message: 'a>(
             .wrapping(text::Wrapping::None),
     ]
     .spacing(m::GAP_TINY);
-    container(container(contents).width(Fill).clip(true))
-        .width(Fill)
+    container(container(contents).width(width).clip(true))
+        .width(width)
         .padding(m::QUOTE_PADDING)
         .style(appearance::quote)
         .into()

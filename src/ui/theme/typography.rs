@@ -11,5 +11,7 @@ pub(crate) const HEADING_FONT: Font = Font {
     ..BODY_FONT
 };
 pub(crate) const BODY_SIZE: u32 = 15;
+pub(crate) const MESSAGE_SIZE: u32 = 14;
+pub(crate) const MESSAGE_METADATA: u32 = 11;
 pub(crate) const ROW_TITLE: u32 = 14;
-pub(crate) const MESSAGE_LINE_HEIGHT: LineHeight = LineHeight::Relative(1.32);
+pub(crate) const MESSAGE_LINE_HEIGHT: LineHeight = LineHeight::Relative(1.24);

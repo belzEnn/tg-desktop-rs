@@ -25,10 +25,7 @@ pub(in crate::ui) fn view<'a>(
             .into();
     };
 
-    let mut history = column![]
-        .spacing(m::GAP)
-        .width(iced::Fill)
-        .padding(m::CONVERSATION_PADDING);
+    let mut history = column![].width(iced::Fill).padding(m::CONVERSATION_PADDING);
     if state.history_loading() {
         history = history.push(text("Loading messages…").style(appearance::muted_text));
     } else if state.messages().is_empty() && state.history_error().is_none() {
@@ -38,8 +35,13 @@ pub(in crate::ui) fn view<'a>(
         history = history.push(text(error).style(appearance::error_text));
     }
     let link = colors::link(state.color_scheme());
+    let private_chat = chat.last_read_outbox_message_id.is_some();
+    let mut previous = None;
     for message in state.messages() {
-        history = history.push(message::view(chat, message, link));
+        let grouped =
+            previous.is_some_and(|previous| continues_group(previous, message, private_chat));
+        history = history.push(message::view(chat, message, link, grouped));
+        previous = Some(message);
     }
     let history = scrollable(history)
         .id(app::CHAT_HISTORY_SCROLL_ID)
@@ -61,6 +63,20 @@ pub(in crate::ui) fn view<'a>(
     .height(iced::Fill)
     .style(appearance::conversation)
     .into()
+}
+
+fn continues_group(previous: &ChatMessage, current: &ChatMessage, private_chat: bool) -> bool {
+    const GROUP_INTERVAL_SECONDS: i64 = 120;
+    private_chat
+        && previous.can_reference
+        && current.can_reference
+        && previous.is_text
+        && current.is_text
+        && previous.is_outgoing == current.is_outgoing
+        && previous.date > 0
+        && previous.date / 86_400 == current.date / 86_400
+        && (0..=GROUP_INTERVAL_SECONDS)
+            .contains(&(i64::from(current.date) - i64::from(previous.date)))
 }
 
 #[derive(Clone)]
@@ -282,6 +298,37 @@ mod tests {
         Fill, Point,
         widget::{mouse_area, space},
     };
+
+    #[test]
+    fn tight_spacing_applies_only_to_consecutive_private_text_messages() {
+        let mut previous = ChatMessage {
+            id: 1,
+            date: 86_400 + 60,
+            sender_name: String::new(),
+            text: "Hello".into(),
+            text_runs: Box::default(),
+            is_outgoing: false,
+            can_reference: true,
+            is_text: true,
+            is_edited: false,
+            spoilers_revealed: false,
+            reply: None,
+            forwarded_from: None,
+        };
+        let mut current = previous.clone();
+        current.id = 2;
+        current.date += 35;
+        assert!(continues_group(&previous, &current, true));
+        assert!(!continues_group(&previous, &current, false));
+        current.is_outgoing = true;
+        assert!(!continues_group(&previous, &current, true));
+        current.is_outgoing = false;
+        current.date += 120;
+        assert!(!continues_group(&previous, &current, true));
+        previous.date = 2 * 86_400 - 30;
+        current.date = previous.date + 35;
+        assert!(!continues_group(&previous, &current, true));
+    }
 
     #[test]
     fn right_click_on_scrolled_message_uses_window_coordinates() {
