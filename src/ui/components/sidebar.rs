@@ -66,7 +66,7 @@ fn chat_row<'a>(
             None => "",
         };
         let mut time =
-            text(time_label(chat.last_message_date, prefix, "")).size(ty::MESSAGE_METADATA);
+            text(time_label(chat.last_message_date, prefix, "")).size(ty::DIALOG_METADATA);
         if enabled {
             time = time.style(appearance::muted_text);
         }

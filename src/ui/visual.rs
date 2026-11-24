@@ -62,7 +62,10 @@ fn workspace_fits_supported_sizes_and_keeps_history_and_composer_visible() {
         assert_eq!(history.y + history.height, composer.y);
         assert!(history.height > 0.0 && composer.height > 0.0);
         let scrollable = conversation.child(1).child(0);
-        let outgoing = scrollable.child(0).child(outgoing_index).child(0).bounds();
+        let messages = scrollable.child(0);
+        let outgoing = messages.child(outgoing_index).child(0).bounds();
+        let short_bubble = messages.child(state.messages().len() - 1).child(0).bounds();
+        assert!((34.0..=40.0).contains(&short_bubble.height));
         assert_eq!(
             outgoing.x + outgoing.width + f32::from(m::CONVERSATION_PADDING),
             history.x + history.width,
