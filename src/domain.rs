@@ -39,6 +39,21 @@ pub enum BackendEvent {
     AuthorizationError(String),
     /// A chat in the main list was added or updated.
     ChatUpdated(ChatSummary),
+    /// A ranked page of main-list summaries from the backend.
+    ChatPageLoaded {
+        request_id: u64,
+        next_offset: usize,
+        next_after: Option<i64>,
+        has_more: bool,
+        chats: Vec<ChatSummary>,
+    },
+    /// A main-list page could not be loaded.
+    ChatPageFailed {
+        request_id: u64,
+        message: String,
+    },
+    /// The backend lost some list updates and needs to refresh visible dialogs.
+    ChatListInvalidated,
     /// A chat was removed from the main list.
     ChatRemoved(i64),
     /// TDLib's latest read boundary and unread count for a chat.
@@ -132,6 +147,16 @@ pub enum BackendEvent {
         chat_id: i64,
         message: String,
     },
+}
+
+/// Describes a ranked range of main-list chats requested by the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChatPageQuery {
+    pub request_id: u64,
+    pub offset: usize,
+    pub limit: usize,
+    pub after: Option<i64>,
+    pub load_missing: bool,
 }
 
 /// Identifies a message within its chat.

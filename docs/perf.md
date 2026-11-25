@@ -241,3 +241,19 @@ Older-page requests run alongside the update loop, with one pending request
 for the active chat and up to 50 messages per page. Request latency and
 authenticated RSS after login, opening a chat, and one hour of operation
 remain pending on Telegram's test DC.
+
+## Phase 7.3 — lazy dialog pages
+
+Five paired headless debug runs compared `d77b1f1` with Phase 7.3 using the
+1024 × 768 tiny-skia probe with 50 dialog summaries in both builds.
+
+| Loaded messages | Preparation before | Preparation after | RSS before | RSS after |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 0.660 ms | 0.661 ms | 21,524 KiB | 21,476 KiB |
+| 250 | 0.694 ms | 0.703 ms | 21,560 KiB | 21,424 KiB |
+
+These medians cover view, layout, and draw preparation with a warm viewport.
+At sign-in the application requests up to 50 dialog summaries. Later requests
+read the ranked IDs from TDLib and resolve only the requested range. Network
+page latency and authenticated RSS after login, opening a chat, and one hour
+of operation remain pending on Telegram's test DC.

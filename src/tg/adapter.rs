@@ -21,7 +21,8 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::domain::{
-    AuthorizationState, BackendEvent, ChatMessage, DeleteScope, MessageAction, MessageAddress,
+    AuthorizationState, BackendEvent, ChatMessage, ChatPageQuery, DeleteScope, MessageAction,
+    MessageAddress,
 };
 
 use super::mapping;
@@ -31,7 +32,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 const UPDATE_CHANNEL_CAPACITY: usize = 64;
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
-const CHAT_LIST_LIMIT: i32 = 50;
+const CHAT_PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CHAT_HISTORY_LIMIT: usize = 50;
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
 const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -66,6 +67,7 @@ enum BackendCommand {
     SubmitCode(String),
     SubmitPassword(String),
     OpenChat(i64),
+    LoadChatPage(ChatPageQuery),
     MarkRead {
         address: MessageAddress,
         request_id: u64,
@@ -245,6 +247,14 @@ impl Adapter {
             .await
     }
 
+    /// Loads the requested range of main-list chat summaries.
+    pub(crate) async fn load_chat_page(
+        &self,
+        query: ChatPageQuery,
+    ) -> Result<(), AdapterCommandError> {
+        self.send_command(BackendCommand::LoadChatPage(query)).await
+    }
+
     /// Opens a chat in TDLib and requests its latest messages.
     pub(crate) async fn open_chat(&self, chat_id: i64) -> Result<(), AdapterCommandError> {
         self.commands
@@ -407,13 +417,13 @@ async fn run_supervisor(
 ) {
     let mut client_id = initial_client_id;
     let mut client_closed = false;
-    let mut main_chats_loaded = false;
     let mut account_user_id = None;
     let mut open_chat_id = None;
     let mut pending_message_ids = HashMap::new();
     let mut pending_forward = None;
     let mut background_requests = JoinSet::new();
     let mut history_page_job: Option<(u64, tokio::task::AbortHandle)> = None;
+    let mut chat_page_job: Option<tokio::task::AbortHandle> = None;
     loop {
         tokio::select! {
             Some(result) = background_requests.join_next(), if !background_requests.is_empty() => {
@@ -437,9 +447,6 @@ async fn run_supervisor(
                             let state = mapping::authorization_state_from_tdlib(&state);
                             if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                                 break;
-                            }
-                            if state == AuthorizationState::Ready && !main_chats_loaded {
-                                main_chats_loaded = load_main_chats(client_id, &mut account_user_id, &events).await;
                             }
                         }
                         Err(error) => {
@@ -481,6 +488,26 @@ async fn run_supervisor(
                             mapping::authorization_error(error.message),
                         )).await;
                     }
+                }
+                Some(BackendCommand::LoadChatPage(query)) => {
+                    if client_closed {
+                        let _ = events.send(BackendEvent::ChatPageFailed {
+                            request_id: query.request_id,
+                            message: "Telegram is no longer connected.".into(),
+                        }).await;
+                        continue;
+                    }
+                    if let Some(job) = chat_page_job.take() {
+                        job.abort();
+                    }
+                    if account_user_id.is_none() {
+                        account_user_id = tokio::time::timeout(
+                            INITIALIZATION_TIMEOUT, tdlib_rs::functions::get_me(client_id),
+                        ).await.ok().and_then(Result::ok).map(mapping::user_id);
+                    }
+                    chat_page_job = Some(background_requests.spawn(
+                        load_chat_page(query, client_id, account_user_id),
+                    ));
                 }
                 Some(BackendCommand::OpenChat(chat_id)) => {
                     if let Some((_, job)) = history_page_job.take() {
@@ -614,8 +641,10 @@ async fn run_supervisor(
                             if let Some((_, job)) = history_page_job.take() {
                                 job.abort();
                             }
+                            if let Some(job) = chat_page_job.take() {
+                                job.abort();
+                            }
                             client_closed = true;
-                            main_chats_loaded = false;
                             account_user_id = None;
                             open_chat_id = None;
                             pending_message_ids.clear();
@@ -623,9 +652,6 @@ async fn run_supervisor(
                         }
                         if events.send(BackendEvent::AuthorizationChanged(state)).await.is_err() {
                             break;
-                        }
-                        if state == AuthorizationState::Ready && !main_chats_loaded {
-                            main_chats_loaded = load_main_chats(client_id, &mut account_user_id, &events).await;
                         }
                         if state == AuthorizationState::WaitTdlibParameters
                             && let Some(error) = configure_tdlib(
@@ -751,8 +777,10 @@ async fn run_supervisor(
                                 if let Some((_, job)) = history_page_job.take() {
                                     job.abort();
                                 }
+                                if let Some(job) = chat_page_job.take() {
+                                    job.abort();
+                                }
                                 client_closed = true;
-                                main_chats_loaded = false;
                                 account_user_id = None;
                                 open_chat_id = None;
                                 pending_message_ids.clear();
@@ -762,7 +790,7 @@ async fn run_supervisor(
                                 break;
                             }
                             if state == AuthorizationState::Ready {
-                                main_chats_loaded = load_main_chats(client_id, &mut account_user_id, &events).await;
+                                let _ = events.send(BackendEvent::ChatListInvalidated).await;
                             } else if state == AuthorizationState::WaitTdlibParameters
                                 && let Some(error) = configure_tdlib(
                                     client_id,
@@ -1036,70 +1064,93 @@ async fn cached_sender_name(
     name
 }
 
-async fn load_main_chats(
+async fn load_chat_page(
+    query: ChatPageQuery,
     client_id: i32,
-    account_user_id: &mut Option<i64>,
-    events: &mpsc::Sender<BackendEvent>,
-) -> bool {
-    if account_user_id.is_none() {
-        *account_user_id = tdlib_rs::functions::get_me(client_id)
-            .await
-            .ok()
-            .map(mapping::user_id);
-    }
-
-    let load_result = tdlib_rs::functions::load_chats(
-        Some(tdlib_rs::enums::ChatList::Main),
-        CHAT_LIST_LIMIT,
-        client_id,
-    )
-    .await;
-    let load_was_expected = match load_result {
-        Ok(()) => true,
-        Err(error) if error.code == 404 => true,
-        Err(error) => {
-            warn!(code = error.code, "could not load Telegram chat list");
-            false
-        }
-    };
-
-    let chat_ids = match tdlib_rs::functions::get_chats(
-        Some(tdlib_rs::enums::ChatList::Main),
-        CHAT_LIST_LIMIT,
-        client_id,
+    account_user_id: Option<i64>,
+) -> BackendEvent {
+    match tokio::time::timeout(
+        CHAT_PAGE_TIMEOUT,
+        read_chat_page(query, client_id, account_user_id),
     )
     .await
     {
-        Ok(tdlib_rs::enums::Chats::Chats(chats)) => chats.chat_ids,
-        Err(error) => {
-            warn!(
-                code = error.code,
-                "could not read cached Telegram chat list"
-            );
-            return load_was_expected;
-        }
-    };
-    tracing::info!(count = chat_ids.len(), "loaded Telegram chat list snapshot");
+        Ok(Ok(event)) => event,
+        Ok(Err(error)) => BackendEvent::ChatPageFailed {
+            request_id: query.request_id,
+            message: format!("Could not load chats (error {}).", error.code),
+        },
+        Err(_) => BackendEvent::ChatPageFailed {
+            request_id: query.request_id,
+            message: "Loading chats timed out.".into(),
+        },
+    }
+}
 
-    let mut published_count = 0;
-    for chat_id in chat_ids {
-        match tdlib_rs::functions::get_chat(chat_id, client_id).await {
-            Ok(tdlib_rs::enums::Chat::Chat(chat)) => {
-                if let Some(chat) = mapping::chat(&chat, *account_user_id) {
-                    if events.send(BackendEvent::ChatUpdated(chat)).await.is_err() {
-                        return false;
-                    }
-                    published_count += 1;
-                }
-            }
-            Err(error) => warn!(code = error.code, "could not read cached Telegram chat"),
+async fn read_chat_page(
+    query: ChatPageQuery,
+    client_id: i32,
+    account_user_id: Option<i64>,
+) -> Result<BackendEvent, tdlib_rs::types::Error> {
+    let list = Some(tdlib_rs::enums::ChatList::Main);
+    // TDLib's offset-free snapshot provides IDs only. Hydrate just the
+    // requested range. Keep a lookahead to avoid requesting an already cached
+    // page from the server after scrolling back to it.
+    let end = query.offset.saturating_add(query.limit).saturating_add(1);
+    let limit = i32::try_from(end).unwrap_or(i32::MAX);
+    let cached_ids = |limit| tdlib_rs::functions::get_chats(list.clone(), limit, client_id);
+    let tdlib_rs::enums::Chats::Chats(mut snapshot) = cached_ids(limit).await?;
+    let mut reached_end = false;
+    let mut offset = chat_page_offset(query, &snapshot.chat_ids);
+    let requested =
+        i32::try_from(offset.saturating_add(query.limit).saturating_add(1)).unwrap_or(i32::MAX);
+    if query.load_missing && requested as usize > snapshot.chat_ids.len() {
+        let missing = (requested as usize - snapshot.chat_ids.len()).min(query.limit);
+        match tdlib_rs::functions::load_chats(list.clone(), missing as i32, client_id).await {
+            Ok(()) => {}
+            Err(error) if error.code == 404 => reached_end = true,
+            Err(error) => return Err(error),
+        }
+        let tdlib_rs::enums::Chats::Chats(current) = cached_ids(requested).await?;
+        snapshot = current;
+        offset = chat_page_offset(query, &snapshot.chat_ids);
+    }
+    // A snapshot may shrink while a page is requested. Clamp to what exists.
+    offset = offset.min(snapshot.chat_ids.len());
+    let next_offset = offset
+        .saturating_add(query.limit)
+        .min(snapshot.chat_ids.len());
+    if query.load_missing && !reached_end && next_offset == offset {
+        return Ok(BackendEvent::ChatPageFailed {
+            request_id: query.request_id,
+            message: "Telegram did not return the requested chat page.".into(),
+        });
+    }
+    let has_more = next_offset < snapshot.chat_ids.len() || (query.load_missing && !reached_end);
+    let mut chats = Vec::with_capacity(next_offset - offset);
+    for &chat_id in &snapshot.chat_ids[offset..next_offset] {
+        let tdlib_rs::enums::Chat::Chat(chat) =
+            tdlib_rs::functions::get_chat(chat_id, client_id).await?;
+        if let Some(chat) = mapping::chat(&chat, account_user_id) {
+            chats.push(chat);
         }
     }
-    tracing::info!(
-        count = published_count,
-        "published Telegram chats to application"
-    );
-    load_was_expected
+    Ok(BackendEvent::ChatPageLoaded {
+        request_id: query.request_id,
+        next_offset,
+        next_after: next_offset
+            .checked_sub(1)
+            .map(|last| snapshot.chat_ids[last]),
+        has_more,
+        chats,
+    })
+}
+
+fn chat_page_offset(query: ChatPageQuery, ids: &[i64]) -> usize {
+    query
+        .after
+        .and_then(|after| ids.iter().position(|&id| id == after))
+        .map_or(query.offset, |position| query.offset.min(position + 1))
 }
 
 async fn configure_tdlib(

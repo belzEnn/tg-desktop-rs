@@ -15,7 +15,26 @@ pub(in crate::ui) fn view(state: &app::State, width: f32) -> Element<'_, app::Me
     for chat in state.chats() {
         chats = chats.push(chat_row(state, chat, forwarding));
     }
-    container(scrollable(chats).height(Length::Fill))
+    if let Some(error) = state.chat_page_error() {
+        chats = chats
+            .push(text(error).style(appearance::error_text))
+            .push(button("Retry").on_press(app::Message::RetryChatPage));
+    } else if state.chat_page_loading() {
+        chats = chats.push(text("Loading chats…").style(appearance::muted_text));
+    }
+    let list = scrollable(chats)
+        .height(Length::Fill)
+        .on_scroll(|viewport| {
+            let offset_y = viewport.absolute_offset().y;
+            let viewport_height = viewport.bounds().height;
+            let remaining_y = viewport.content_bounds().height - viewport_height - offset_y;
+            app::Message::ChatsScrolled {
+                offset_y,
+                remaining_y,
+                viewport_height,
+            }
+        });
+    container(list)
         .style(appearance::surface)
         .width(width)
         .height(Length::Fill)
