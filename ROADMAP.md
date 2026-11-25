@@ -124,7 +124,7 @@ measurements.
 
 ## 7. Scrolling at scale
 
-- **7.1 Virtualized message list.** ☐ Only visible rows are built and drawn;
+- **7.1 Virtualized message list.** ✅ Only visible rows are built and drawn;
   stable scroll position when history loads above.
 - **7.2 Infinite scroll upward.** ☐ Replaces the "Load more" button.
 - **7.3 Lazy chat list.** ☐ Load chats in pages; keep only what is needed in

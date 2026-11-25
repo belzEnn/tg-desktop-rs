@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use super::message;
 use crate::ui::theme::{appearance, colors, metrics as m};
 use crate::{
@@ -11,7 +13,7 @@ use iced::{
         widget::{Id, Operation, Tree, operation, tree},
     },
     mouse,
-    widget::{center, column, container, scrollable, text},
+    widget::{Column, center, column, container, scrollable, space, text},
     window,
 };
 
@@ -25,40 +27,11 @@ pub(in crate::ui) fn view<'a>(
             .into();
     };
 
-    let mut history = column![].width(iced::Fill).padding(m::CONVERSATION_PADDING);
-    if state.history_loading() {
-        history = history.push(text("Loading messages…").style(appearance::muted_text));
-    } else if state.messages().is_empty() && state.history_error().is_none() {
-        history = history.push(text("No messages in this chat.").style(appearance::muted_text));
-    }
-    if let Some(error) = state.history_error() {
-        history = history.push(text(error).style(appearance::error_text));
-    }
-    let link = colors::link(state.color_scheme());
-    let private_chat = chat.last_read_outbox_message_id.is_some();
-    let mut previous = None;
-    for message in state.messages() {
-        let grouped =
-            previous.is_some_and(|previous| continues_group(previous, message, private_chat));
-        history = history.push(message::view(chat, message, link, grouped));
-        previous = Some(message);
-    }
-    let history = scrollable(history)
-        .width(iced::Fill)
-        .id(app::CHAT_HISTORY_SCROLL_ID)
-        .on_scroll(|viewport| HistoryEvent::Scrolled {
-            offset_y: viewport.absolute_offset().y,
-            content_height: viewport.content_bounds().height,
-        })
-        .height(iced::Shrink);
-    let read = state.read_after(chat).map(|after| VisibleHistory {
-        chat_id: chat.id,
-        after,
-        messages: state.messages(),
-    });
     container(Element::new(History {
-        content: history.into(),
-        read,
+        content: scrollable(column![]).into(),
+        read: None,
+        source: Some(HistorySource { state, chat }),
+        geometry: Geometry::default(),
     }))
     .width(iced::Fill)
     .height(iced::Fill)
@@ -87,7 +60,6 @@ fn continues_group(previous: &ChatMessage, current: &ChatMessage, private_chat: 
 
 #[derive(Clone)]
 pub(super) enum HistoryEvent {
-    Scrolled { offset_y: f32, content_height: f32 },
     OpenMenu { chat_id: i64, message_id: i64 },
     RevealSpoilers(MessageAddress),
 }
@@ -97,29 +69,331 @@ pub(super) enum HistoryEvent {
 struct History<'a> {
     content: Element<'a, HistoryEvent>,
     read: Option<VisibleHistory<'a>>,
+    source: Option<HistorySource<'a>>,
+    geometry: Geometry,
+}
+
+#[derive(Clone, Copy)]
+struct HistorySource<'a> {
+    state: &'a app::State,
+    chat: &'a ChatSummary,
+}
+
+#[derive(Default)]
+struct HistoryViewport {
+    chat_id: Option<i64>,
+    width: f32,
+    heights: HashMap<i64, RowMeasurement>,
+    anchor: Option<RowAnchor>,
+    history_end_revision: u64,
+    reported: Option<(f32, f32)>,
+    visible_ids: Vec<i64>,
+    has_status: bool,
+}
+
+struct RowMeasurement {
+    signature: u64,
+    height: f32,
+}
+
+#[derive(Clone, Copy)]
+struct RowAnchor {
+    id: i64,
+    index: usize,
+    inset: f32,
+}
+
+#[derive(Default)]
+struct Geometry {
+    offsets: Vec<f32>,
+    translation: f32,
+    extent: f32,
+}
+
+impl Geometry {
+    fn anchor_at(&self, messages: &[ChatMessage], offset: f32) -> Option<RowAnchor> {
+        let index = self
+            .offsets
+            .partition_point(|&top| top <= offset)
+            .saturating_sub(1)
+            .min(messages.len().saturating_sub(1));
+        Some(RowAnchor {
+            id: messages.get(index)?.id,
+            index,
+            inset: offset - self.offsets.get(index)?,
+        })
+    }
+}
+
+impl<'a> HistorySource<'a> {
+    fn status(&self) -> Option<Element<'a, HistoryEvent>> {
+        if let Some(error) = self.state.history_error() {
+            Some(text(error).style(appearance::error_text).into())
+        } else if self.state.history_loading() {
+            Some(
+                text("Loading messages…")
+                    .style(appearance::muted_text)
+                    .into(),
+            )
+        } else if self.state.messages().is_empty() {
+            Some(
+                text("No messages in this chat.")
+                    .style(appearance::muted_text)
+                    .into(),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> History<'a> {
+    fn layout_rows(
+        &mut self,
+        source: HistorySource<'a>,
+        state: &mut HistoryViewport,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> (f32, bool) {
+        const ESTIMATED_ROW_HEIGHT: f32 = 48.0;
+        const MEASURED_ROW_LIMIT: usize = 1024;
+        let padding = f32::from(m::CONVERSATION_PADDING);
+        let width = (limits.max().width - 2.0 * padding).max(0.0);
+        let height = limits.max().height;
+        let history_end_revision = source.state.history_end_revision();
+        if state.chat_id != Some(source.chat.id) {
+            *state = HistoryViewport {
+                chat_id: Some(source.chat.id),
+                history_end_revision,
+                ..HistoryViewport::default()
+            };
+        } else if state.history_end_revision != history_end_revision {
+            state.history_end_revision = history_end_revision;
+            state.anchor = None;
+        }
+        if state.width != width {
+            state.width = width;
+            state.heights.clear();
+        }
+        let messages = source.state.messages();
+        if messages.is_empty() {
+            state.anchor = None;
+        }
+        let mut status = source.status();
+        let status_height = status
+            .as_mut()
+            .map_or(0.0, |status| measure_height(status, renderer, width));
+        let private_chat = source.chat.last_read_outbox_message_id.is_some();
+        let link = colors::link(source.state.color_scheme());
+        let mut measure = |index: usize| {
+            let entry = &messages[index];
+            let grouped = index
+                .checked_sub(1)
+                .is_some_and(|previous| continues_group(&messages[previous], entry, private_chat));
+            let mut row = message::view(source.chat, entry, link, grouped);
+            let signature = message::layout_signature(source.chat, entry, grouped);
+            let measurement = state
+                .heights
+                .entry(entry.id)
+                .or_insert_with(|| RowMeasurement {
+                    signature,
+                    height: measure_height(&mut row, renderer, width),
+                });
+            if measurement.signature != signature {
+                *measurement = RowMeasurement {
+                    signature,
+                    height: measure_height(&mut row, renderer, width),
+                };
+            }
+            (entry.id, row, measurement.height)
+        };
+
+        // A scrolled history is anchored to a message and an intra-row offset.
+        // At the newest edge, work backwards so the latest message stays visible.
+        let mut start = state.anchor.map_or(messages.len(), |anchor| {
+            messages
+                .iter()
+                .position(|message| message.id == anchor.id)
+                .unwrap_or(anchor.index.min(messages.len().saturating_sub(1)))
+        });
+        let anchor_index = start;
+        let mut end = start;
+        let mut rows = Vec::new();
+        let mut inset = state.anchor.map_or(0.0, |anchor| anchor.inset);
+        let mut remaining = height;
+        while end < messages.len() && (remaining > 0.0 || rows.is_empty()) {
+            let row = measure(end);
+            if end == anchor_index {
+                // A width or content change can shorten the anchored row.
+                // Clamp before deciding how many following rows to build.
+                inset = inset.min((row.2 - 1.0).max(0.0));
+                remaining += inset;
+                state.anchor = Some(RowAnchor {
+                    id: row.0,
+                    index: end,
+                    inset,
+                });
+            }
+            remaining -= row.2;
+            rows.push(row);
+            end += 1;
+        }
+        if end == messages.len() {
+            remaining -= padding;
+        }
+        // The viewport can hit the newest edge after a resize or deletion.
+        // Fill any room above the original anchor before clamping the scroll.
+        let mut preceding = Vec::new();
+        while start > 0 && remaining > 0.0 && end == messages.len() {
+            start -= 1;
+            let row = measure(start);
+            remaining -= row.2;
+            preceding.push(row);
+        }
+
+        let row_origin = padding + status_height;
+        let offsets = &mut self.geometry.offsets;
+        offsets.clear();
+        offsets.push(row_origin);
+        for message in messages {
+            let height = state
+                .heights
+                .get(&message.id)
+                .map_or(ESTIMATED_ROW_HEIGHT, |row| row.height);
+            offsets.push(offsets.last().copied().unwrap_or(row_origin) + height);
+        }
+        if state.heights.len() > MEASURED_ROW_LIMIT {
+            let spare = MEASURED_ROW_LIMIT.saturating_sub(end - start);
+            let keep_start = start
+                .saturating_sub(spare / 2)
+                .min(messages.len().saturating_sub(MEASURED_ROW_LIMIT));
+            let keep_end = (keep_start + MEASURED_ROW_LIMIT).min(messages.len());
+            let kept: HashSet<_> = messages[keep_start..keep_end]
+                .iter()
+                .map(|message| message.id)
+                .collect();
+            state.heights.retain(|id, _| kept.contains(id));
+        }
+        let has_status = status.is_some();
+        let visible_ids = messages[start..end].iter().map(|message| message.id);
+        let rows_changed = state.has_status != has_status
+            || state.visible_ids.iter().copied().ne(visible_ids.clone());
+        if rows_changed {
+            state.has_status = has_status;
+            state.visible_ids.clear();
+            state.visible_ids.extend(visible_ids);
+        }
+        // Keep both spacer nodes even when their heights are zero.
+        let mut children = Vec::with_capacity(end - start + 2 + usize::from(has_status));
+        children.extend(status);
+        children.push(space().height(offsets[start] - row_origin).into());
+        children.extend(
+            preceding
+                .into_iter()
+                .rev()
+                .chain(rows)
+                .map(|(_, row, _)| row),
+        );
+        children.push(
+            space()
+                .height(offsets[messages.len()] - offsets[end])
+                .into(),
+        );
+        let history = Column::from_vec(children)
+            .width(iced::Fill)
+            .padding(m::CONVERSATION_PADDING);
+        self.content = scrollable(history)
+            .width(iced::Fill)
+            .id(app::CHAT_HISTORY_SCROLL_ID)
+            .height(iced::Shrink)
+            .into();
+        self.read = source
+            .state
+            .read_after(source.chat)
+            .map(|after| VisibleHistory {
+                chat_id: source.chat.id,
+                after,
+                first_message: 1 + usize::from(has_status),
+                messages: &messages[start..end],
+            });
+        let target = if state.anchor.is_some() {
+            offsets[anchor_index] + inset
+        } else {
+            f32::INFINITY
+        };
+        (target, rows_changed)
+    }
+
+    fn scroll_translation(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        target: Option<f32>,
+    ) -> ScrollTranslation {
+        let mut scroll = ScrollTranslation {
+            target,
+            ..ScrollTranslation::default()
+        };
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, &mut scroll);
+        scroll
+    }
+}
+
+fn measure_height(element: &mut Element<'_, HistoryEvent>, renderer: &Renderer, width: f32) -> f32 {
+    let mut tree = Tree::new(&*element);
+    let limits = layout::Limits::new(Size::ZERO, Size::new(width, f32::INFINITY));
+    element
+        .as_widget_mut()
+        .layout(&mut tree, renderer, &limits)
+        .size()
+        .height
 }
 
 struct VisibleHistory<'a> {
     chat_id: i64,
     after: i64,
+    first_message: usize,
     messages: &'a [ChatMessage],
 }
 
 #[derive(Default)]
-struct ScrollTranslation(Vector);
+struct ScrollTranslation {
+    value: Vector,
+    extent: f32,
+    viewport_height: f32,
+    target: Option<f32>,
+}
 
 impl Operation for ScrollTranslation {
-    fn traverse(&mut self, _: &mut dyn FnMut(&mut dyn Operation)) {}
+    fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn Operation)) {
+        if self.extent == 0.0 {
+            children(self);
+        }
+    }
 
     fn scrollable(
         &mut self,
         _: Option<&Id>,
-        _: Rectangle,
-        _: Rectangle,
+        bounds: Rectangle,
+        content: Rectangle,
         translation: Vector,
-        _: &mut dyn operation::Scrollable,
+        state: &mut dyn operation::Scrollable,
     ) {
-        self.0 = translation;
+        self.extent = content.height;
+        self.viewport_height = bounds.height;
+        self.value = translation;
+        if let Some(target) = self.target {
+            let offset = target.clamp(0.0, (content.height - bounds.height).max(0.0));
+            state.scroll_to(operation::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(offset),
+            });
+            // Iced rounds the translation it reports for the applied offset.
+            self.value.y = offset.round();
+        }
     }
 }
 
@@ -130,10 +404,8 @@ impl VisibleHistory<'_> {
         viewport: Rectangle,
         scroll_y: f32,
     ) -> Option<MessageAddress> {
-        // History appends one layout child per message after any status rows.
-        let first_message = content.children().len().checked_sub(self.messages.len())?;
         let row_bottom = |index| {
-            let row = content.child(first_message + index).bounds();
+            let row = content.child(self.first_message + index).bounds();
             row.y + row.height - scroll_y
         };
         let bottom = viewport.y + viewport.height;
@@ -168,23 +440,23 @@ impl VisibleHistory<'_> {
 
 impl Widget<app::Message, Theme, Renderer> for History<'_> {
     fn tag(&self) -> tree::Tag {
-        self.content.as_widget().tag()
+        tree::Tag::of::<HistoryViewport>()
     }
 
     fn state(&self) -> tree::State {
-        self.content.as_widget().state()
+        tree::State::new(HistoryViewport::default())
     }
 
     fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
+        Size::new(iced::Fill, iced::Shrink)
     }
 
     fn children(&self) -> Vec<Tree> {
-        self.content.as_widget().children()
+        vec![Tree::new(&self.content)]
     }
 
-    fn diff(&self, tree: &mut Tree) {
-        self.content.as_widget().diff(tree);
+    fn diff(&self, _tree: &mut Tree) {
+        // The scrollable's rows are reconciled once their viewport is known.
     }
 
     fn layout(
@@ -193,7 +465,28 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        self.content.as_widget_mut().layout(tree, renderer, limits)
+        let target = if let Some(source) = self.source {
+            let (target, rows_changed) =
+                self.layout_rows(source, tree.state.downcast_mut(), renderer, limits);
+            if rows_changed {
+                // A recycled row must not inherit another message's mouse state.
+                tree.children[0].children.clear();
+            }
+            Some(target)
+        } else {
+            None
+        };
+        tree.children[0].diff(&self.content);
+        let node = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        if target.is_some() {
+            let scroll = self.scroll_translation(tree, Layout::new(&node), renderer, target);
+            self.geometry.translation = scroll.value.y;
+            self.geometry.extent = scroll.extent;
+        }
+        node
     }
 
     fn operate(
@@ -205,7 +498,7 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
     ) {
         self.content
             .as_widget_mut()
-            .operate(tree, layout, renderer, operation);
+            .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
     fn draw(
@@ -218,9 +511,15 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.content
-            .as_widget()
-            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
     }
 
     fn mouse_interaction(
@@ -231,9 +530,13 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.content
-            .as_widget()
-            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 
     fn update(
@@ -250,7 +553,7 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
         let mut events = Vec::new();
         let mut history = Shell::new(&mut events);
         self.content.as_widget_mut().update(
-            tree,
+            &mut tree.children[0],
             event,
             layout,
             cursor,
@@ -260,13 +563,6 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
             viewport,
         );
         shell.merge(history, |message| match message {
-            HistoryEvent::Scrolled {
-                offset_y,
-                content_height,
-            } => app::Message::HistoryScrolled {
-                offset_y,
-                content_height,
-            },
             HistoryEvent::RevealSpoilers(address) => app::Message::RevealSpoilers(address),
             HistoryEvent::OpenMenu {
                 chat_id,
@@ -281,18 +577,37 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
                     }
                 }),
         });
+        let scroll = self.scroll_translation(tree, layout, renderer, None);
+        if let Some(source) = &self.source {
+            let state = tree.state.downcast_mut::<HistoryViewport>();
+            if scroll.value.y != self.geometry.translation {
+                let max_offset = (scroll.extent - scroll.viewport_height).max(0.0).round();
+                state.anchor = (scroll.value.y < max_offset)
+                    .then(|| {
+                        self.geometry
+                            .anchor_at(source.state.messages(), scroll.value.y)
+                    })
+                    .flatten();
+                shell.invalidate_layout();
+                shell.request_redraw();
+                return;
+            }
+            let geometry = (self.geometry.translation, self.geometry.extent);
+            if state.reported != Some(geometry) {
+                state.reported = Some(geometry);
+                shell.publish(app::Message::HistoryScrolled {
+                    offset_y: geometry.0,
+                    content_height: geometry.1,
+                });
+            }
+        }
         if matches!(event, Event::Window(window::Event::RedrawRequested(_)))
             && let Some(read) = &self.read
             && let Some(visible) = layout.bounds().intersection(viewport)
             && let Some(content) = layout.children().next()
+            && let Some(address) = read.boundary(content, visible, scroll.value.y)
         {
-            let mut scroll = ScrollTranslation::default();
-            self.content
-                .as_widget_mut()
-                .operate(tree, layout, renderer, &mut scroll);
-            if let Some(address) = read.boundary(content, visible, scroll.0.y) {
-                shell.publish(app::Message::HistoryReadBoundary(address));
-            }
+            shell.publish(app::Message::HistoryReadBoundary(address));
         }
     }
 }
@@ -304,6 +619,223 @@ mod tests {
         Fill, Point,
         widget::{mouse_area, space},
     };
+
+    #[test]
+    fn large_history_keeps_its_anchor_on_prepend_and_jumps_to_end_on_send() {
+        use crate::domain::BackendEvent;
+        use iced::{Font, Pixels, advanced::clipboard, widget::text_editor};
+        use std::time::Instant;
+
+        let chat = ChatSummary {
+            id: 17,
+            title: "History".into(),
+            last_message_id: None,
+            last_message_date: None,
+            last_message_is_outgoing: false,
+            last_message_preview: String::new(),
+            unread_count: 0,
+            last_read_inbox_message_id: 0,
+            last_read_outbox_message_id: Some(0),
+            position: 1,
+            can_receive_forwards: true,
+        };
+        let message = |id| ChatMessage {
+            id,
+            date: 0,
+            sender_name: String::new(),
+            text: if id == 550 {
+                "Tall message\n".repeat(250)
+            } else if id % 2 == 0 {
+                "One line".into()
+            } else {
+                "First line\nSecond line\nThird line".into()
+            },
+            text_runs: Box::default(),
+            is_outgoing: false,
+            can_reference: true,
+            is_text: true,
+            is_edited: false,
+            spoilers_revealed: false,
+            reply: None,
+            forwarded_from: None,
+        };
+        let mut app = app::visual_fixture(
+            crate::config::ColorScheme::Light,
+            vec![chat.clone()],
+            (51..=550).map(message).collect(),
+        );
+        let renderer = Renderer::new(Font::default(), Pixels(16.0));
+        let size = Size::new(320.0, 300.0);
+        let limits = layout::Limits::new(Size::ZERO, size);
+        let mut widget = view(&app, Some(&chat));
+        let mut tree = Tree::new(&widget);
+        let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let scroll = Layout::new(&node).child(0);
+        assert!(scroll.child(0).children().len() < 15);
+
+        let mut events = Vec::new();
+        let mut shell = Shell::new(&mut events);
+        widget.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: 500.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(20.0, 40.0)),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(size),
+        );
+        assert!(shell.is_layout_invalid());
+        let anchor = tree.state.downcast_ref::<HistoryViewport>().anchor.unwrap();
+        assert_eq!(anchor.id, 550);
+        assert!(anchor.inset > 1000.0);
+        drop(widget);
+
+        drop(app::update(
+            &mut app,
+            app::Message::BackendEvent(BackendEvent::MessageContentChanged {
+                address: MessageAddress {
+                    chat_id: chat.id,
+                    message_id: 550,
+                },
+                text: "Shortened message".into(),
+                text_runs: Box::default(),
+                is_text: true,
+            }),
+        ));
+        let mut widget = view(&app, Some(&chat));
+        tree.diff(&widget);
+        let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let scroll = Layout::new(&node).child(0);
+        assert!(scroll.child(0).children().len() < 15);
+
+        let offset = 2300.0;
+        widget.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut ScrollTranslation {
+                target: Some(offset),
+                ..ScrollTranslation::default()
+            },
+        );
+        widget.as_widget_mut().update(
+            &mut tree,
+            &Event::Window(window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut Vec::new()),
+            &Rectangle::with_size(size),
+        );
+        let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let scroll = Layout::new(&node).child(0);
+        assert!(scroll.child(0).children().len() < 15);
+        let before = tree.state.downcast_ref::<HistoryViewport>().anchor.unwrap();
+        let (id, inset) = (before.id, before.inset);
+        let before_node = scroll.child(0).child(1).bounds();
+        let mut before_scroll = ScrollTranslation::default();
+        widget.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut before_scroll,
+        );
+        drop(widget);
+
+        drop(app::update(
+            &mut app,
+            app::Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+                chat_id: chat.id,
+                messages: (1..=50).map(message).collect(),
+                has_older_messages: true,
+            }),
+        ));
+        let mut widget = view(&app, Some(&chat));
+        tree.diff(&widget);
+        let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let scroll = Layout::new(&node).child(0);
+        assert!(scroll.child(0).children().len() < 15);
+        let after = tree.state.downcast_ref::<HistoryViewport>().anchor.unwrap();
+        assert_eq!((after.id, after.inset), (id, inset));
+        let mut after_scroll = ScrollTranslation::default();
+        widget
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after_scroll);
+        let after_node = scroll.child(0).child(1).bounds();
+        assert!(
+            ((before_node.y - before_scroll.value.y) - (after_node.y - after_scroll.value.y)).abs()
+                < 0.01
+        );
+
+        let narrower = layout::Limits::new(Size::ZERO, Size::new(250.0, size.height));
+        let node = widget
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &narrower);
+        let scroll = Layout::new(&node).child(0);
+        assert!(scroll.child(0).children().len() < 15);
+        assert_eq!(
+            tree.state
+                .downcast_ref::<HistoryViewport>()
+                .anchor
+                .unwrap()
+                .id,
+            id
+        );
+        drop(widget);
+
+        drop(app::update(
+            &mut app,
+            app::Message::ComposerAction(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new("New message".into()),
+            ))),
+        ));
+        drop(app::update(&mut app, app::Message::Submit));
+        let sent = app.messages().last().unwrap();
+        assert_eq!(sent.text, "New message");
+
+        let mut widget = view(&app, Some(&chat));
+        tree.diff(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &narrower);
+        let viewport = tree.state.downcast_ref::<HistoryViewport>();
+        assert!(viewport.anchor.is_none());
+        assert_eq!(viewport.visible_ids.last(), Some(&sent.id));
+
+        let mut scroll = ScrollTranslation::default();
+        widget
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut scroll);
+        assert!(scroll.value.y > 0.0);
+        assert_eq!(
+            scroll.value.y,
+            (scroll.extent - scroll.viewport_height).round()
+        );
+
+        let mut events = Vec::new();
+        let mut shell = Shell::new(&mut events);
+        widget.as_widget_mut().update(
+            &mut tree,
+            &Event::Window(window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(narrower.max()),
+        );
+        assert!(!shell.is_layout_invalid());
+        assert!(
+            tree.state
+                .downcast_ref::<HistoryViewport>()
+                .anchor
+                .is_none()
+        );
+    }
 
     #[test]
     fn tight_spacing_applies_only_to_consecutive_private_text_messages() {
@@ -360,6 +892,8 @@ mod tests {
                 .height(Fill)
                 .into(),
             read: None,
+            source: None,
+            geometry: Geometry::default(),
         };
         let renderer = Renderer::new(Font::default(), Pixels(16.0));
         let size = Size::new(320.0, 100.0);
@@ -442,8 +976,11 @@ mod tests {
             read: Some(VisibleHistory {
                 chat_id: 17,
                 after: 0,
+                first_message: 1,
                 messages: &messages,
             }),
+            source: None,
+            geometry: Geometry::default(),
         };
         let renderer = Renderer::new(Font::default(), Pixels(16.0));
         let size = Size::new(320.0, 100.0);

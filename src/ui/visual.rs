@@ -63,8 +63,10 @@ fn workspace_fits_supported_sizes_and_keeps_history_and_composer_visible() {
         assert!(history.height > 0.0 && composer.height > 0.0);
         let scrollable = conversation.child(1).child(0);
         let messages = scrollable.child(0);
-        let outgoing = messages.child(outgoing_index).child(0).bounds();
-        let short_bubble = messages.child(state.messages().len() - 1).child(0).bounds();
+        let rendered = messages.children().len() - 2;
+        let first = state.messages().len() - rendered;
+        let outgoing = messages.child(1 + outgoing_index - first).child(0).bounds();
+        let short_bubble = messages.child(rendered).child(0).bounds();
         assert!((34.0..=40.0).contains(&short_bubble.height));
         assert_eq!(
             outgoing.x + outgoing.width + f32::from(m::CONVERSATION_PADDING),
@@ -259,4 +261,69 @@ fn message(id: i64, sender: &str, content: &str, outgoing: bool) -> ChatMessage 
         reply: None,
         forwarded_from: None,
     }
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "reports synthetic layout time and Linux RSS"]
+fn measure_scrolling_at_scale() {
+    use iced::advanced::Renderer as _;
+
+    let message_count: i64 = std::env::var("UI_PERF_MESSAGES")
+        .map_or(250, |count| count.parse().expect("valid message count"));
+    let fixture = fixture(ColorScheme::Light);
+    let mut chats = Vec::with_capacity(50);
+    for index in 0..50 {
+        let mut chat = fixture.chats()[index % fixture.chats().len()].clone();
+        chat.id = index as i64 + 1;
+        chats.push(chat);
+    }
+    let messages = (1..=message_count)
+        .map(|id| {
+            let mut entry =
+                fixture.messages()[(id - 1) as usize % fixture.messages().len()].clone();
+            entry.id = id;
+            entry
+        })
+        .collect();
+    let state = app::visual_fixture(ColorScheme::Light, chats, messages);
+    let theme = theme::iced_theme(state.color_scheme());
+    let mut renderer = renderer();
+    let viewport = Rectangle::with_size(m::WINDOW_SIZE);
+    let limits = Limits::new(Size::ZERO, m::WINDOW_SIZE);
+    let mut tree = Tree::empty();
+    let mut iterations = || {
+        let mut element = view(&state);
+        tree.diff(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        renderer.reset(viewport);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &theme,
+            &Style {
+                text_color: theme.palette().text,
+            },
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+    };
+    for _ in 0..5 {
+        iterations();
+    }
+    let start = Instant::now();
+    for _ in 0..50 {
+        iterations();
+    }
+    let layout_ms = start.elapsed().as_secs_f64() * 20.0;
+    let physical = Size::new(m::WINDOW_SIZE.width as u32, m::WINDOW_SIZE.height as u32);
+    let _pixels = renderer.screenshot(physical, 1.0, theme.palette().background);
+    let proc_status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let rss = proc_status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))
+        .unwrap();
+    println!("messages={message_count} layout_ms={layout_ms:.3} {rss}");
 }

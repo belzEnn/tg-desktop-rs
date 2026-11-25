@@ -9,7 +9,28 @@ use iced::{
     font,
     widget::{column, container, mouse_area, rich_text, row, span, text},
 };
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    hash::{DefaultHasher, Hash, Hasher},
+};
+
+pub(super) fn layout_signature(chat: &ChatSummary, message: &ChatMessage, grouped: bool) -> u64 {
+    let mut hash = DefaultHasher::new();
+    grouped.hash(&mut hash);
+    chat.last_read_outbox_message_id.is_some().hash(&mut hash);
+    message.sender_name.hash(&mut hash);
+    message.text.hash(&mut hash);
+    message.text_runs.hash(&mut hash);
+    message.spoilers_revealed.hash(&mut hash);
+    message.is_outgoing.hash(&mut hash);
+    message.is_text.hash(&mut hash);
+    message.is_edited.hash(&mut hash);
+    message.date.hash(&mut hash);
+    message.forwarded_from.hash(&mut hash);
+    outgoing_check_mark(message, chat.last_read_outbox_message_id).hash(&mut hash);
+    message.reply.as_deref().map(reply_text).hash(&mut hash);
+    hash.finish()
+}
 
 pub(super) fn view<'a>(
     chat: &ChatSummary,
@@ -47,11 +68,8 @@ pub(super) fn view<'a>(
         );
     }
     if let Some(reply) = &message.reply {
-        let sender = reply
-            .preview
-            .as_ref()
-            .and_then(|preview| preview.sender_name.as_deref());
-        body = body.push(reply_preview(sender, reply.display_text(), iced::Shrink));
+        let (sender, snippet) = reply_text(reply);
+        body = body.push(reply_preview(sender, snippet, iced::Shrink));
     }
     let content = content.view(address, link);
     let check = outgoing_check_mark(message, chat.last_read_outbox_message_id);
@@ -242,6 +260,14 @@ fn outgoing_check_mark(message: &ChatMessage, read_through: Option<i64>) -> Opti
     } else {
         None
     }
+}
+
+fn reply_text(reply: &crate::domain::MessageReply) -> (Option<&str>, &str) {
+    let sender = reply
+        .preview
+        .as_ref()
+        .and_then(|preview| preview.sender_name.as_deref());
+    (sender, reply.display_text())
 }
 
 pub(super) fn reply_preview<'a, Message: 'a>(

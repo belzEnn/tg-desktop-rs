@@ -204,3 +204,24 @@ the same viewport.
 The deltas were 0.051 ms and 232 KiB. These measurements cover a 1024 × 768
 viewport and fixed synthetic data. Native scrolling and resizing latency
 and the authenticated RSS scenarios remain pending.
+
+## Phase 7.1 — virtualized history
+
+Five paired headless debug runs compared `b05a9e6` with Phase 7.1 using 50
+dialog summaries and a 1024 × 768 viewport. The tiny-skia probe warmed up
+for five iterations, measured 50 view, layout, and draw preparation
+iterations, then rasterized one frame and sampled Linux `VmRSS`.
+
+| Loaded messages | Preparation before | Preparation after | RSS before | RSS after |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 0.788 ms | 0.669 ms | 22,256 KiB | 21,404 KiB |
+| 250 | 1.605 ms | 0.692 ms | 26,696 KiB | 21,460 KiB |
+
+The medians at 250 messages fell by 57% for preparation and 20% for RSS.
+The history stores at most 1,024 measured heights and a position per loaded
+message. The probe covers a warm viewport and excludes TDLib, native input
+latency, and presentation. Reproduce it with
+`UI_PERF_MESSAGES=250 cargo test measure_scrolling_at_scale -- --ignored --nocapture`.
+
+Authenticated test-DC RSS remains pending after login, after opening a chat,
+and after one hour of operation.

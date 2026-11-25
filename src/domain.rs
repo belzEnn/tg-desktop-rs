@@ -164,7 +164,7 @@ pub enum MessageAction {
 }
 
 /// Formatting flags that can apply to the same piece of message text.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct TextStyle(u8);
 
 impl TextStyle {
@@ -187,7 +187,7 @@ impl TextStyle {
 }
 
 /// A contiguous UTF-8 text segment. Its start is zero or the end of the previous segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextRun {
     pub end: usize,
     pub style: TextStyle,

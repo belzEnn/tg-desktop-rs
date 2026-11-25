@@ -46,8 +46,7 @@ pub(crate) struct State {
     has_older_messages: bool,
     loading_older_messages: bool,
     history_load_trigger_armed: bool,
-    history_content_height: f32,
-    pending_scroll_adjustment: Option<f32>,
+    history_end_revision: u64,
     composer: text_editor::Content,
     next_temporary_message_id: i64,
     send_error: Option<String>,
@@ -198,8 +197,7 @@ pub(crate) fn boot(
         has_older_messages: false,
         loading_older_messages: false,
         history_load_trigger_armed: false,
-        history_content_height: 0.0,
-        pending_scroll_adjustment: None,
+        history_end_revision: 0,
         composer: text_editor::Content::new(),
         next_temporary_message_id: -1,
         send_error: None,
@@ -288,8 +286,6 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.has_older_messages = false;
                 state.loading_older_messages = false;
                 state.history_load_trigger_armed = false;
-                state.history_content_height = 0.0;
-                state.pending_scroll_adjustment = None;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 state.reply_to = None;
@@ -396,11 +392,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.has_older_messages = has_older_messages;
                 state.loading_older_messages = false;
                 state.history_load_trigger_armed = false;
-                state.pending_scroll_adjustment = None;
-                return Task::batch([
-                    iced::widget::operation::snap_to_end(CHAT_HISTORY_SCROLL_ID),
-                    refresh_reply_previews(state),
-                ]);
+                return refresh_reply_previews(state);
             }
         }
         Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
@@ -413,18 +405,14 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.has_older_messages = has_older_messages;
                 state.history_error = None;
                 if !messages.is_empty() {
-                    state.pending_scroll_adjustment = Some(state.history_content_height);
                     prepend_messages(&mut state.messages, messages);
                     return refresh_reply_previews(state);
-                } else {
-                    state.pending_scroll_adjustment = None;
                 }
             }
         }
         Message::BackendEvent(BackendEvent::OlderChatHistoryError { chat_id, message }) => {
             if state.open_chat_id == Some(chat_id) {
                 state.loading_older_messages = false;
-                state.pending_scroll_adjustment = None;
                 state.history_error = Some(message);
             }
         }
@@ -646,8 +634,6 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.has_older_messages = false;
                 state.loading_older_messages = false;
                 state.history_load_trigger_armed = false;
-                state.history_content_height = 0.0;
-                state.pending_scroll_adjustment = None;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 state.history_loading = true;
@@ -699,20 +685,6 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             content_height,
         } => {
             state.message_menu = None;
-            state.history_content_height = content_height;
-            if let Some(previous_content_height) = state.pending_scroll_adjustment.take() {
-                let added_height = (content_height - previous_content_height).max(0.0);
-                if added_height > 0.0 {
-                    return iced::widget::operation::scroll_by(
-                        CHAT_HISTORY_SCROLL_ID,
-                        iced::widget::operation::AbsoluteOffset {
-                            x: 0.0,
-                            y: added_height,
-                        },
-                    );
-                }
-            }
-
             let near_prefetch_point =
                 content_height > 0.0 && offset_y / content_height <= HISTORY_PREFETCH_FRACTION;
             if !near_prefetch_point {
@@ -1023,6 +995,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                     forwarded_from: None,
                 },
             );
+            state.history_end_revision = state.history_end_revision.wrapping_add(1);
             state.composer = text_editor::Content::new();
             state.send_error = None;
             let backend = state.backend.clone();
@@ -1446,7 +1419,6 @@ impl State {
             && self.open_chat_id == Some(chat.id)
             && !self.logout_pending
             && !self.history_loading
-            && self.pending_scroll_adjustment.is_none()
             && self.delete_confirmation.is_none()
             && chat.unread_count > 0
     }
@@ -1481,6 +1453,9 @@ impl State {
     }
     pub(crate) fn history_error(&self) -> Option<&str> {
         self.history_error.as_deref()
+    }
+    pub(crate) fn history_end_revision(&self) -> u64 {
+        self.history_end_revision
     }
     fn referenceable_message(&self, message_id: i64) -> Option<&ChatMessage> {
         self.messages
@@ -1723,7 +1698,9 @@ mod tests {
         assert_eq!(state.composer.text(), state.messages[0].text);
 
         state.composer = text_editor::Content::with_text("edited text");
+        let history_end_revision = state.history_end_revision();
         let _ = update(&mut state, Message::Submit);
+        assert_eq!(state.history_end_revision(), history_end_revision);
         let request_id = state.pending_mutation.as_ref().unwrap().request_id;
         let _ = update(
             &mut state,
