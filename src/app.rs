@@ -18,10 +18,6 @@ use crate::{
 };
 
 const REPLY_LOOKUP_BATCH_SIZE: usize = 4;
-const HISTORY_PAGE_SIZE: usize = 50;
-const HISTORY_PREFETCH_AFTER_MESSAGES: usize = 30;
-const HISTORY_PREFETCH_FRACTION: f32 =
-    (HISTORY_PAGE_SIZE - HISTORY_PREFETCH_AFTER_MESSAGES) as f32 / HISTORY_PAGE_SIZE as f32;
 pub(crate) const CHAT_HISTORY_SCROLL_ID: &str = "chat-history";
 pub(crate) const CHAT_COMPOSER_ID: &str = "chat-composer";
 
@@ -44,8 +40,8 @@ pub(crate) struct State {
     history_loading: bool,
     history_error: Option<String>,
     has_older_messages: bool,
-    loading_older_messages: bool,
-    history_load_trigger_armed: bool,
+    older_history_request: Option<u64>,
+    older_history_failed: bool,
     history_end_revision: u64,
     composer: text_editor::Content,
     next_temporary_message_id: i64,
@@ -106,6 +102,13 @@ pub(crate) struct ForwardSelection {
     pub destination: Option<i64>,
 }
 
+/// Direction of a history scroll gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryScrollDirection {
+    Up,
+    Down,
+}
+
 /// Messages handled by the application update loop.
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
@@ -130,11 +133,13 @@ pub(crate) enum Message {
     },
     ChatOpenCommandSent(Result<(), AdapterCommandError>),
     HistoryScrolled {
+        chat_id: i64,
         offset_y: f32,
-        content_height: f32,
+        viewport_height: f32,
+        direction: Option<HistoryScrollDirection>,
     },
     OlderMessagesCommandSent {
-        chat_id: i64,
+        request_id: u64,
         result: Result<(), AdapterCommandError>,
     },
     ComposerAction(text_editor::Action),
@@ -195,8 +200,8 @@ pub(crate) fn boot(
         history_loading: false,
         history_error: None,
         has_older_messages: false,
-        loading_older_messages: false,
-        history_load_trigger_armed: false,
+        older_history_request: None,
+        older_history_failed: false,
         history_end_revision: 0,
         composer: text_editor::Content::new(),
         next_temporary_message_id: -1,
@@ -284,8 +289,8 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.message_action_error = None;
                 state.messages.clear();
                 state.has_older_messages = false;
-                state.loading_older_messages = false;
-                state.history_load_trigger_armed = false;
+                state.older_history_request = None;
+                state.older_history_failed = false;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 state.reply_to = None;
@@ -390,18 +395,18 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.history_loading = false;
                 state.history_error = None;
                 state.has_older_messages = has_older_messages;
-                state.loading_older_messages = false;
-                state.history_load_trigger_armed = false;
+                state.older_history_request = None;
+                state.older_history_failed = false;
                 return refresh_reply_previews(state);
             }
         }
         Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
-            chat_id,
+            request_id,
             messages,
             has_older_messages,
         }) => {
-            if state.open_chat_id == Some(chat_id) {
-                state.loading_older_messages = false;
+            if state.older_history_request == Some(request_id) {
+                state.older_history_request = None;
                 state.has_older_messages = has_older_messages;
                 state.history_error = None;
                 if !messages.is_empty() {
@@ -410,11 +415,11 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::BackendEvent(BackendEvent::OlderChatHistoryError { chat_id, message }) => {
-            if state.open_chat_id == Some(chat_id) {
-                state.loading_older_messages = false;
-                state.history_error = Some(message);
-            }
+        Message::BackendEvent(BackendEvent::OlderChatHistoryError {
+            request_id,
+            message,
+        }) => {
+            fail_older_history(state, request_id, message);
         }
         Message::BackendEvent(BackendEvent::ChatHistoryError { chat_id, message }) => {
             if state.open_chat_id == Some(chat_id) {
@@ -632,8 +637,8 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.forward_status = None;
                 state.messages.clear();
                 state.has_older_messages = false;
-                state.loading_older_messages = false;
-                state.history_load_trigger_armed = false;
+                state.older_history_request = None;
+                state.older_history_failed = false;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 state.history_loading = true;
@@ -681,44 +686,24 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::HistoryScrolled {
+            chat_id,
             offset_y,
-            content_height,
+            viewport_height,
+            direction,
         } => {
-            state.message_menu = None;
-            let near_prefetch_point =
-                content_height > 0.0 && offset_y / content_height <= HISTORY_PREFETCH_FRACTION;
-            if !near_prefetch_point {
-                state.history_load_trigger_armed = true;
-            } else if state.history_load_trigger_armed
-                && state.has_older_messages
-                && !state.loading_older_messages
-            {
-                let Some(oldest_message_id) = state.messages.first().map(|message| message.id)
-                else {
-                    return Task::none();
-                };
-                let Some(chat_id) = state.open_chat_id else {
-                    return Task::none();
-                };
-                state.history_load_trigger_armed = false;
-                state.loading_older_messages = true;
-                let backend = state.backend.clone();
-                return Task::perform(
-                    async move {
-                        backend
-                            .load_older_messages(chat_id, oldest_message_id)
-                            .await
-                    },
-                    move |result| Message::OlderMessagesCommandSent { chat_id, result },
-                );
+            if state.open_chat_id == Some(chat_id) {
+                if direction.is_some() {
+                    state.message_menu = None;
+                }
+                if viewport_height > 0.0 && offset_y <= viewport_height {
+                    let retry = direction == Some(HistoryScrollDirection::Up);
+                    return request_older_history(state, chat_id, retry);
+                }
             }
         }
-        Message::OlderMessagesCommandSent { chat_id, result } => {
-            if let Err(error) = result
-                && state.open_chat_id == Some(chat_id)
-            {
-                state.loading_older_messages = false;
-                state.history_error = Some(error.to_string());
+        Message::OlderMessagesCommandSent { request_id, result } => {
+            if let Err(error) = result {
+                fail_older_history(state, request_id, error.to_string());
             }
         }
         Message::ComposerAction(action) => {
@@ -1033,6 +1018,45 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::AuthorizationCommandSent(Ok(())) => {}
     }
     Task::none()
+}
+
+fn request_older_history(state: &mut State, chat_id: i64, retry: bool) -> Task<Message> {
+    if !state.has_older_messages
+        || state.older_history_request.is_some()
+        || (state.older_history_failed && !retry)
+    {
+        return Task::none();
+    }
+    let Some(before_message_id) = state
+        .messages
+        .iter()
+        .filter(|message| message.can_reference && message.id > 0)
+        .map(|message| message.id)
+        .min()
+    else {
+        return Task::none();
+    };
+    let request_id = state.action_request_id();
+    state.older_history_request = Some(request_id);
+    state.older_history_failed = false;
+    state.history_error = None;
+    let backend = state.backend.clone();
+    Task::perform(
+        async move {
+            backend
+                .load_older_messages(chat_id, before_message_id, request_id)
+                .await
+        },
+        move |result| Message::OlderMessagesCommandSent { request_id, result },
+    )
+}
+
+fn fail_older_history(state: &mut State, request_id: u64, message: String) {
+    if state.older_history_request == Some(request_id) {
+        state.older_history_request = None;
+        state.older_history_failed = true;
+        state.history_error = Some(message);
+    }
 }
 
 fn request_read_receipt(state: &mut State) -> Task<Message> {
@@ -1451,6 +1475,9 @@ impl State {
     pub(crate) fn history_loading(&self) -> bool {
         self.history_loading
     }
+    pub(crate) fn loading_older_history(&self) -> bool {
+        self.older_history_request.is_some()
+    }
     pub(crate) fn history_error(&self) -> Option<&str> {
         self.history_error.as_deref()
     }
@@ -1516,6 +1543,20 @@ impl State {
 }
 
 #[cfg(test)]
+pub(crate) fn visual_history_page(state: &mut State, messages: Vec<ChatMessage>) {
+    let request_id = state.action_request_id();
+    state.older_history_request = Some(request_id);
+    drop(update(
+        state,
+        Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+            request_id,
+            messages,
+            has_older_messages: true,
+        }),
+    ));
+}
+
+#[cfg(test)]
 pub(crate) fn visual_fixture(
     scheme: crate::config::ColorScheme,
     chats: Vec<ChatSummary>,
@@ -1559,6 +1600,117 @@ mod tests {
             preview: None,
         }));
         message
+    }
+
+    #[test]
+    fn older_history_prefetch_retries_on_input_and_ignores_stale_results() {
+        let mut state = visual_fixture(
+            crate::config::ColorScheme::Light,
+            vec![unread_chat(10)],
+            vec![message(50)],
+        );
+        state.has_older_messages = true;
+        let scroll = |offset_y, direction| Message::HistoryScrolled {
+            chat_id: 10,
+            offset_y,
+            viewport_height: 300.0,
+            direction,
+        };
+        let up = Some(HistoryScrollDirection::Up);
+        let down = Some(HistoryScrollDirection::Down);
+        drop(update(&mut state, scroll(450.0, up)));
+        assert_eq!(state.older_history_request, None);
+        drop(update(&mut state, scroll(0.0, None)));
+        let first = state.older_history_request.unwrap();
+        drop(update(&mut state, scroll(0.0, up)));
+        assert_eq!(state.older_history_request, Some(first));
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::OlderChatHistoryError {
+                request_id: first,
+                message: "Try again".into(),
+            }),
+        ));
+        drop(update(&mut state, scroll(0.0, None)));
+        drop(update(&mut state, scroll(0.0, down)));
+        assert_eq!(state.older_history_request, None);
+
+        drop(update(&mut state, scroll(0.0, up)));
+        let retry = state.older_history_request.unwrap();
+        assert_ne!(first, retry);
+        assert!(state.history_error().is_none());
+        for request_id in [first, retry] {
+            drop(update(
+                &mut state,
+                Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+                    request_id,
+                    messages: vec![message(40)],
+                    has_older_messages: true,
+                }),
+            ));
+            if request_id == first {
+                assert_eq!(state.older_history_request, Some(retry));
+                assert_eq!(state.messages.len(), 1);
+            }
+        }
+        assert_eq!(state.messages.len(), 2);
+        assert!(state.has_older_messages);
+        assert!(state.history_error().is_none());
+        drop(update(&mut state, scroll(0.0, None)));
+        let next = state.older_history_request.unwrap();
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+                request_id: next,
+                messages: vec![],
+                has_older_messages: false,
+            }),
+        ));
+        drop(update(&mut state, scroll(0.0, up)));
+        assert_eq!(state.older_history_request, None);
+    }
+
+    #[test]
+    fn switching_chats_discards_the_previous_history_page() {
+        let mut state = visual_fixture(
+            crate::config::ColorScheme::Light,
+            vec![unread_chat(10), unread_chat(20)],
+            vec![message(50)],
+        );
+        state.has_older_messages = true;
+        let scroll = |chat_id| Message::HistoryScrolled {
+            chat_id,
+            offset_y: 0.0,
+            viewport_height: 300.0,
+            direction: None,
+        };
+        drop(update(&mut state, scroll(10)));
+        let previous = state.older_history_request.unwrap();
+
+        drop(update(&mut state, Message::OpenChat(20)));
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::ChatHistoryLoaded {
+                chat_id: 20,
+                messages: vec![message(60)],
+                has_older_messages: true,
+            }),
+        ));
+        drop(update(&mut state, scroll(10)));
+        assert_eq!(state.older_history_request, None);
+        drop(update(&mut state, scroll(20)));
+        let current = state.older_history_request.unwrap();
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+                request_id: previous,
+                messages: vec![message(40)],
+                has_older_messages: false,
+            }),
+        ));
+        assert_eq!(state.older_history_request, Some(current));
+        assert_eq!(state.messages, vec![message(60)]);
+        assert!(state.has_older_messages);
     }
 
     #[test]

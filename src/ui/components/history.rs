@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::message;
 use crate::ui::theme::{appearance, colors, metrics as m};
 use crate::{
-    app,
+    app::{self, HistoryScrollDirection},
     domain::{ChatMessage, ChatSummary, MessageAddress},
 };
 use iced::{
@@ -86,7 +86,8 @@ struct HistoryViewport {
     heights: HashMap<i64, RowMeasurement>,
     anchor: Option<RowAnchor>,
     history_end_revision: u64,
-    reported: Option<(f32, f32)>,
+    reported: Option<(f32, f32, f32)>,
+    scroll_direction: Option<HistoryScrollDirection>,
     visible_ids: Vec<i64>,
     has_status: bool,
 }
@@ -132,6 +133,12 @@ impl<'a> HistorySource<'a> {
         } else if self.state.history_loading() {
             Some(
                 text("Loading messages…")
+                    .style(appearance::muted_text)
+                    .into(),
+            )
+        } else if self.state.loading_older_history() {
+            Some(
+                text("Loading older messages…")
                     .style(appearance::muted_text)
                     .into(),
             )
@@ -582,22 +589,45 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
             let state = tree.state.downcast_mut::<HistoryViewport>();
             if scroll.value.y != self.geometry.translation {
                 let max_offset = (scroll.extent - scroll.viewport_height).max(0.0).round();
-                state.anchor = (scroll.value.y < max_offset)
-                    .then(|| {
-                        self.geometry
-                            .anchor_at(source.state.messages(), scroll.value.y)
-                    })
-                    .flatten();
+                state.anchor = if scroll.value.y < max_offset {
+                    self.geometry
+                        .anchor_at(source.state.messages(), scroll.value.y)
+                } else {
+                    None
+                };
+                state.scroll_direction = Some(if scroll.value.y < self.geometry.translation {
+                    HistoryScrollDirection::Up
+                } else {
+                    HistoryScrollDirection::Down
+                });
                 shell.invalidate_layout();
                 shell.request_redraw();
                 return;
             }
-            let geometry = (self.geometry.translation, self.geometry.extent);
-            if state.reported != Some(geometry) {
+            // At the top edge another upward gesture may retry a failed page
+            // even when the scroll offset cannot change.
+            let wheel_at_edge = cursor.is_over(layout.bounds())
+                && matches!(event,
+                    Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. }
+                    }) if *y > 0.0
+                )
+                && scroll.value.y <= scroll.viewport_height;
+            let direction = wheel_at_edge
+                .then_some(HistoryScrollDirection::Up)
+                .or(state.scroll_direction.take());
+            let geometry = (
+                self.geometry.translation,
+                self.geometry.extent,
+                scroll.viewport_height,
+            );
+            if state.reported != Some(geometry) || direction.is_some() {
                 state.reported = Some(geometry);
                 shell.publish(app::Message::HistoryScrolled {
+                    chat_id: source.chat.id,
                     offset_y: geometry.0,
-                    content_height: geometry.1,
+                    viewport_height: geometry.2,
+                    direction,
                 });
             }
         }
@@ -746,14 +776,7 @@ mod tests {
         );
         drop(widget);
 
-        drop(app::update(
-            &mut app,
-            app::Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
-                chat_id: chat.id,
-                messages: (1..=50).map(message).collect(),
-                has_older_messages: true,
-            }),
-        ));
+        app::visual_history_page(&mut app, (1..=50).map(message).collect());
         let mut widget = view(&app, Some(&chat));
         tree.diff(&widget);
         let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);

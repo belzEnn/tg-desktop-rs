@@ -33,6 +33,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHAT_LIST_LIMIT: i32 = 50;
 const CHAT_HISTORY_LIMIT: usize = 50;
+const HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
 const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Errors raised while starting the TDLib adapter.
@@ -72,6 +73,7 @@ enum BackendCommand {
     LoadOlderMessages {
         chat_id: i64,
         before_message_id: i64,
+        request_id: u64,
     },
     SendText {
         chat_id: i64,
@@ -269,14 +271,14 @@ impl Adapter {
         &self,
         chat_id: i64,
         before_message_id: i64,
+        request_id: u64,
     ) -> Result<(), AdapterCommandError> {
-        self.commands
-            .send(BackendCommand::LoadOlderMessages {
-                chat_id,
-                before_message_id,
-            })
-            .await
-            .map_err(|_| AdapterCommandError::WorkerStopped)
+        self.send_command(BackendCommand::LoadOlderMessages {
+            chat_id,
+            before_message_id,
+            request_id,
+        })
+        .await
     }
 
     /// Sends text with an optional reply to a message in the same chat.
@@ -411,6 +413,7 @@ async fn run_supervisor(
     let mut pending_message_ids = HashMap::new();
     let mut pending_forward = None;
     let mut background_requests = JoinSet::new();
+    let mut history_page_job: Option<(u64, tokio::task::AbortHandle)> = None;
     loop {
         tokio::select! {
             Some(result) = background_requests.join_next(), if !background_requests.is_empty() => {
@@ -445,6 +448,9 @@ async fn run_supervisor(
                     }
                 }
                 Some(BackendCommand::LogOut) => {
+                    if let Some((_, job)) = history_page_job.take() {
+                        job.abort();
+                    }
                     if let Err(error) = tdlib_rs::functions::log_out(client_id).await {
                         let _ = events.send(BackendEvent::AuthorizationError(
                             mapping::authorization_error(error.message),
@@ -477,6 +483,9 @@ async fn run_supervisor(
                     }
                 }
                 Some(BackendCommand::OpenChat(chat_id)) => {
+                    if let Some((_, job)) = history_page_job.take() {
+                        job.abort();
+                    }
                     open_chat_id = None;
                     if let Err(error) = tdlib_rs::functions::open_chat(chat_id, client_id).await {
                         let _ = events.send(BackendEvent::ChatHistoryError {
@@ -486,52 +495,22 @@ async fn run_supervisor(
                         continue;
                     }
                     open_chat_id = Some(chat_id);
-                    let mut messages: Vec<ChatMessage> = Vec::with_capacity(CHAT_HISTORY_LIMIT);
-                    let mut from_message_id = 0;
-                    let mut first_request = true;
-                    loop {
-                        match tdlib_rs::functions::get_chat_history(
-                            chat_id, from_message_id, 0, CHAT_HISTORY_LIMIT as i32, false, client_id,
-                        ).await {
-                            Ok(tdlib_rs::enums::Messages::Messages(page)) => {
-                                let page_messages: Vec<_> = page.messages.into_iter().flatten().collect();
-                                if page_messages.is_empty() {
-                                    if first_request {
-                                        first_request = false;
-                                        continue;
-                                    }
-                                    break;
-                                }
-                                first_request = false;
-                                let oldest_id = page_messages.iter().map(|message| message.id).min().unwrap_or_default();
-                                let received = page_messages.len();
-                                if from_message_id != 0 && oldest_id >= from_message_id {
-                                    break;
-                                }
-                                messages.extend(map_history_messages(page_messages, client_id).await);
-                                if messages.len() >= CHAT_HISTORY_LIMIT || received >= CHAT_HISTORY_LIMIT || oldest_id == 0 {
-                                    break;
-                                }
-                                from_message_id = oldest_id;
-                            }
-                            Err(error) => {
-                                let _ = events.send(BackendEvent::ChatHistoryError {
-                                    chat_id,
-                                    message: format!("Could not load chat history (error {}).", error.code),
-                                }).await;
-                                messages.clear();
-                                break;
-                            }
-                        }
-                    }
-                    messages.sort_by_key(|message| (message.date, message.id));
-                    messages.truncate(CHAT_HISTORY_LIMIT);
-                    let has_older_messages = messages.len() >= CHAT_HISTORY_LIMIT;
-                    let _ = events.send(BackendEvent::ChatHistoryLoaded {
-                        chat_id,
-                        messages,
-                        has_older_messages,
-                    }).await;
+                    let result = tokio::time::timeout(
+                        HISTORY_TIMEOUT, load_initial_history(chat_id, client_id),
+                    ).await;
+                    let event = match result {
+                        Ok(Ok((messages, has_older_messages))) => BackendEvent::ChatHistoryLoaded {
+                            chat_id, messages, has_older_messages,
+                        },
+                        Ok(Err(error)) => BackendEvent::ChatHistoryError {
+                            chat_id,
+                            message: format!("Could not load chat history (error {}).", error.code),
+                        },
+                        Err(_) => BackendEvent::ChatHistoryError {
+                            chat_id, message: "Loading chat history timed out.".into(),
+                        },
+                    };
+                    let _ = events.send(event).await;
                 }
                 Some(BackendCommand::MarkRead { address, request_id }) => {
                     if open_chat_id == Some(address.chat_id) && !client_closed {
@@ -557,37 +536,27 @@ async fn run_supervisor(
                         }).await;
                     }
                 }
-                Some(BackendCommand::LoadOlderMessages { chat_id, before_message_id }) => {
-                    match tdlib_rs::functions::get_chat_history(
-                        chat_id,
-                        before_message_id,
-                        0,
-                        CHAT_HISTORY_LIMIT as i32,
-                        false,
-                        client_id,
-                    ).await {
-                        Ok(tdlib_rs::enums::Messages::Messages(page)) => {
-                            let raw_messages: Vec<_> = page.messages.into_iter().flatten().collect();
-                            let has_older_messages = raw_messages.len() >= CHAT_HISTORY_LIMIT;
-                            let messages = map_history_messages(raw_messages, client_id).await;
-                            let mut messages: Vec<_> = messages.into_iter()
-                                .filter(|message| message.id < before_message_id)
-                                .collect();
-                            messages.sort_by_key(|message| (message.date, message.id));
-                            let has_older_messages = has_older_messages && !messages.is_empty();
-                            let _ = events.send(BackendEvent::OlderChatHistoryLoaded {
-                                chat_id,
-                                messages,
-                                has_older_messages,
-                            }).await;
-                        }
-                        Err(error) => {
-                            let _ = events.send(BackendEvent::OlderChatHistoryError {
-                                chat_id,
-                                message: format!("Could not load older messages (error {}).", error.code),
-                            }).await;
-                        }
+                Some(BackendCommand::LoadOlderMessages { chat_id, before_message_id, request_id }) => {
+                    if open_chat_id != Some(chat_id) || client_closed {
+                        let _ = events.send(BackendEvent::OlderChatHistoryError {
+                            request_id,
+                            message: "The chat is no longer open.".into(),
+                        }).await;
+                        continue;
                     }
+                    if history_page_job
+                        .as_ref()
+                        .is_some_and(|(active, _)| *active >= request_id)
+                    {
+                        continue;
+                    }
+                    if let Some((_, job)) = history_page_job.take() {
+                        job.abort();
+                    }
+                    let job = background_requests.spawn(
+                        load_older_history(chat_id, before_message_id, request_id, client_id),
+                    );
+                    history_page_job = Some((request_id, job));
                 }
                 Some(BackendCommand::SendText { chat_id, message_id, text, reply_to }) => {
                     let content = mapping::input_text_content(text.clone(), true);
@@ -642,6 +611,9 @@ async fn run_supervisor(
                 Some((update, update_client_id)) if update_client_id == client_id => {
                     if let Some(state) = mapping::authorization_state(&update) {
                         if state == AuthorizationState::Closed {
+                            if let Some((_, job)) = history_page_job.take() {
+                                job.abort();
+                            }
                             client_closed = true;
                             main_chats_loaded = false;
                             account_user_id = None;
@@ -776,6 +748,9 @@ async fn run_supervisor(
                         Ok(td_state) => {
                             let state = mapping::authorization_state_from_tdlib(&td_state);
                             if state == AuthorizationState::Closed {
+                                if let Some((_, job)) = history_page_job.take() {
+                                    job.abort();
+                                }
                                 client_closed = true;
                                 main_chats_loaded = false;
                                 account_user_id = None;
@@ -809,6 +784,94 @@ async fn run_supervisor(
                 None => break,
             },
         }
+    }
+}
+
+async fn history_before(
+    chat_id: i64,
+    before: i64,
+    limit: usize,
+    client_id: i32,
+) -> Result<Vec<tdlib_rs::types::Message>, tdlib_rs::types::Error> {
+    // The API may return the boundary itself or temporarily have no rows.
+    // Retry once if the response does not include a strictly older ID.
+    for _ in 0..2 {
+        let tdlib_rs::enums::Messages::Messages(page) = tdlib_rs::functions::get_chat_history(
+            chat_id,
+            before,
+            0,
+            (limit + usize::from(before != 0)) as i32,
+            false,
+            client_id,
+        )
+        .await?;
+        let messages: Vec<_> = page
+            .messages
+            .into_iter()
+            .flatten()
+            .filter(|message| before == 0 || message.id < before)
+            .take(limit)
+            .collect();
+        if !messages.is_empty() {
+            return Ok(messages);
+        }
+    }
+    Ok(Vec::new())
+}
+
+async fn load_initial_history(
+    chat_id: i64,
+    client_id: i32,
+) -> Result<(Vec<ChatMessage>, bool), tdlib_rs::types::Error> {
+    let mut messages = Vec::with_capacity(CHAT_HISTORY_LIMIT);
+    let mut before = 0;
+    while messages.len() < CHAT_HISTORY_LIMIT {
+        let page = history_before(
+            chat_id,
+            before,
+            CHAT_HISTORY_LIMIT - messages.len(),
+            client_id,
+        )
+        .await?;
+        let Some(oldest) = page.iter().map(|message| message.id).min() else {
+            break;
+        };
+        before = oldest;
+        messages.extend(page);
+    }
+    let has_older_messages = messages.len() == CHAT_HISTORY_LIMIT;
+    let mut messages = map_history_messages(messages, client_id).await;
+    messages.sort_by_key(|message| (message.date, message.id));
+    Ok((messages, has_older_messages))
+}
+
+async fn load_older_history(
+    chat_id: i64,
+    before: i64,
+    request_id: u64,
+    client_id: i32,
+) -> BackendEvent {
+    match tokio::time::timeout(HISTORY_TIMEOUT, async {
+        let page = history_before(chat_id, before, CHAT_HISTORY_LIMIT, client_id).await?;
+        let mut messages = map_history_messages(page, client_id).await;
+        messages.sort_by_key(|message| (message.date, message.id));
+        Ok::<_, tdlib_rs::types::Error>(messages)
+    })
+    .await
+    {
+        Ok(Ok(messages)) => BackendEvent::OlderChatHistoryLoaded {
+            request_id,
+            has_older_messages: !messages.is_empty(),
+            messages,
+        },
+        Ok(Err(error)) => BackendEvent::OlderChatHistoryError {
+            request_id,
+            message: format!("Could not load older messages (error {}).", error.code),
+        },
+        Err(_) => BackendEvent::OlderChatHistoryError {
+            request_id,
+            message: "Loading older messages timed out.".into(),
+        },
     }
 }
 

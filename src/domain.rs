@@ -65,13 +65,13 @@ pub enum BackendEvent {
     },
     /// An older page of messages was loaded for the active chat.
     OlderChatHistoryLoaded {
-        chat_id: i64,
+        request_id: u64,
         messages: Vec<ChatMessage>,
         has_older_messages: bool,
     },
     /// Loading an older page failed with a safe-to-display message.
     OlderChatHistoryError {
-        chat_id: i64,
+        request_id: u64,
         message: String,
     },
     /// A newly received or sent message in a chat.

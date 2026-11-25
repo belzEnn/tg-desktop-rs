@@ -225,3 +225,19 @@ latency, and presentation. Reproduce it with
 
 Authenticated test-DC RSS remains pending after login, after opening a chat,
 and after one hour of operation.
+
+## Phase 7.2 — upward history prefetch
+
+Five paired headless debug runs compared `128ba79` with Phase 7.2 using the
+same 1024 × 768 tiny-skia probe and 50 dialog summaries.
+
+| Loaded messages | Preparation before | Preparation after | RSS before | RSS after |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 0.666 ms | 0.665 ms | 21,488 KiB | 21,420 KiB |
+| 250 | 0.700 ms | 0.695 ms | 21,412 KiB | 21,496 KiB |
+
+These medians cover view, layout, and draw preparation with a warm viewport.
+Older-page requests run alongside the update loop, with one pending request
+for the active chat and up to 50 messages per page. Request latency and
+authenticated RSS after login, opening a chat, and one hour of operation
+remain pending on Telegram's test DC.
