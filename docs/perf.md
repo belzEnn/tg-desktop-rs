@@ -257,3 +257,26 @@ At sign-in the application requests up to 50 dialog summaries. Later requests
 read the ranked IDs from TDLib and resolve only the requested range. Network
 page latency and authenticated RSS after login, opening a chat, and one hour
 of operation remain pending on Telegram's test DC.
+
+## Phase 7.4 — bounded caches
+
+Five paired headless debug runs compared `abbfe13` with Phase 7.4 using
+the 1024 × 768 tiny-skia probe and 50 dialog summaries.
+
+| Loaded messages | Preparation before | Preparation after | RSS before | RSS after |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 0.659 ms | 0.657 ms | 21,544 KiB | 21,708 KiB |
+| 250 | 0.691 ms | 0.691 ms | 21,608 KiB | 21,732 KiB |
+
+These medians cover a fixed, warm viewport. Cache tests separately verify
+that scrolling in either direction retains at most 150 dialog summaries
+and 250 history rows, with separate storage for active actions.
+
+Run `scripts/check-rss.sh PID MAX_GROWTH_KIB` once the client is signed in
+to sample RSS every minute for an hour. The script reports the largest
+increase over the first sample and exits with status 1 if it exceeds the
+limit. A short smoke test passed for a stable process and detected more
+than 32 MiB of growth in a process that allocated a 32 MiB buffer.
+
+Authenticated test-DC RSS after login, after opening a chat, and after one
+hour of operation remains pending.

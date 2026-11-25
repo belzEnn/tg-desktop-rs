@@ -129,7 +129,7 @@ measurements.
 - **7.2 Infinite scroll upward.** ✅ Replaces the "Load more" button.
 - **7.3 Lazy chat list.** ✅ Load chats in pages; keep only what is needed in
   memory.
-- **7.4 Bounded caches.** ☐ Size limits and eviction for chats, users and
+- **7.4 Bounded caches.** ✅ Size limits and eviction for chats, users and
   messages; a script that checks RSS growth over a long session.
 
 ## 8. Media inside the budget

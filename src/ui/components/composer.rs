@@ -46,9 +46,7 @@ pub(in crate::ui) fn view(state: &app::State) -> Element<'_, app::Message> {
                 .size(ty::CAPTION),
             );
         }
-        let destination = selection
-            .destination
-            .and_then(|id| state.chats().iter().find(|chat| chat.id == id));
+        let destination = selection.destination.and_then(|id| state.chat(id));
         let caption = if state.forward_pending() {
             "Forwarding…".to_owned()
         } else if let Some(chat) = destination {

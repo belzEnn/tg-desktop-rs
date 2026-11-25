@@ -4,7 +4,7 @@ use super::message;
 use crate::ui::theme::{appearance, colors, metrics as m};
 use crate::{
     app::{self, HistoryScrollDirection},
-    domain::{ChatMessage, ChatSummary, MessageAddress},
+    domain::{ChatMessage, ChatSummary, HistoryEdge, MessageAddress},
 };
 use iced::{
     Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector,
@@ -84,6 +84,7 @@ struct HistoryViewport {
     chat_id: Option<i64>,
     width: f32,
     heights: HashMap<i64, RowMeasurement>,
+    measured_range: Option<(i64, i64, usize)>,
     anchor: Option<RowAnchor>,
     history_end_revision: u64,
     reported: Option<(f32, f32, f32)>,
@@ -127,7 +128,10 @@ impl Geometry {
 }
 
 impl<'a> HistorySource<'a> {
-    fn status(&self) -> Option<Element<'a, HistoryEvent>> {
+    fn status(&self, edge: HistoryEdge) -> Option<Element<'a, HistoryEvent>> {
+        if self.state.history_page_edge().unwrap_or(HistoryEdge::Older) != edge {
+            return None;
+        }
         if let Some(error) = self.state.history_error() {
             Some(text(error).style(appearance::error_text).into())
         } else if self.state.history_loading() {
@@ -136,12 +140,12 @@ impl<'a> HistorySource<'a> {
                     .style(appearance::muted_text)
                     .into(),
             )
-        } else if self.state.loading_older_history() {
-            Some(
-                text("Loading older messages…")
-                    .style(appearance::muted_text)
-                    .into(),
-            )
+        } else if self.state.history_page_edge().is_some() {
+            let label = match edge {
+                HistoryEdge::Older => "Loading older messages…",
+                HistoryEdge::Newer => "Loading newer messages…",
+            };
+            Some(text(label).style(appearance::muted_text).into())
         } else if self.state.messages().is_empty() {
             Some(
                 text("No messages in this chat.")
@@ -163,7 +167,6 @@ impl<'a> History<'a> {
         limits: &layout::Limits,
     ) -> (f32, bool) {
         const ESTIMATED_ROW_HEIGHT: f32 = 48.0;
-        const MEASURED_ROW_LIMIT: usize = 1024;
         let padding = f32::from(m::CONVERSATION_PADDING);
         let width = (limits.max().width - 2.0 * padding).max(0.0);
         let height = limits.max().height;
@@ -186,7 +189,20 @@ impl<'a> History<'a> {
         if messages.is_empty() {
             state.anchor = None;
         }
-        let mut status = source.status();
+        let range = messages
+            .first()
+            .zip(messages.last())
+            .map(|(first, last)| (first.id, last.id, messages.len()));
+        if state.measured_range != range {
+            let current: HashSet<_> = messages.iter().map(|message| message.id).collect();
+            state.heights.retain(|id, _| current.contains(id));
+            state.measured_range = range;
+        }
+        let mut status = source.status(HistoryEdge::Older);
+        let mut newer_status = source.status(HistoryEdge::Newer);
+        let newer_status_height = newer_status
+            .as_mut()
+            .map_or(0.0, |status| measure_height(status, renderer, width));
         let status_height = status
             .as_mut()
             .map_or(0.0, |status| measure_height(status, renderer, width));
@@ -246,7 +262,7 @@ impl<'a> History<'a> {
             end += 1;
         }
         if end == messages.len() {
-            remaining -= padding;
+            remaining -= padding + newer_status_height;
         }
         // The viewport can hit the newest edge after a resize or deletion.
         // Fill any room above the original anchor before clamping the scroll.
@@ -258,6 +274,10 @@ impl<'a> History<'a> {
             preceding.push(row);
         }
 
+        if state.heights.len() > app::HISTORY_CACHE_LIMIT {
+            let current: HashSet<_> = messages.iter().map(|message| message.id).collect();
+            state.heights.retain(|id, _| current.contains(id));
+        }
         let row_origin = padding + status_height;
         let offsets = &mut self.geometry.offsets;
         offsets.clear();
@@ -269,18 +289,6 @@ impl<'a> History<'a> {
                 .map_or(ESTIMATED_ROW_HEIGHT, |row| row.height);
             offsets.push(offsets.last().copied().unwrap_or(row_origin) + height);
         }
-        if state.heights.len() > MEASURED_ROW_LIMIT {
-            let spare = MEASURED_ROW_LIMIT.saturating_sub(end - start);
-            let keep_start = start
-                .saturating_sub(spare / 2)
-                .min(messages.len().saturating_sub(MEASURED_ROW_LIMIT));
-            let keep_end = (keep_start + MEASURED_ROW_LIMIT).min(messages.len());
-            let kept: HashSet<_> = messages[keep_start..keep_end]
-                .iter()
-                .map(|message| message.id)
-                .collect();
-            state.heights.retain(|id, _| kept.contains(id));
-        }
         let has_status = status.is_some();
         let visible_ids = messages[start..end].iter().map(|message| message.id);
         let rows_changed = state.has_status != has_status
@@ -291,7 +299,9 @@ impl<'a> History<'a> {
             state.visible_ids.extend(visible_ids);
         }
         // Keep both spacer nodes even when their heights are zero.
-        let mut children = Vec::with_capacity(end - start + 2 + usize::from(has_status));
+        let mut children = Vec::with_capacity(
+            end - start + 2 + usize::from(has_status) + usize::from(newer_status.is_some()),
+        );
         children.extend(status);
         children.push(space().height(offsets[start] - row_origin).into());
         children.extend(
@@ -306,6 +316,7 @@ impl<'a> History<'a> {
                 .height(offsets[messages.len()] - offsets[end])
                 .into(),
         );
+        children.extend(newer_status);
         let history = Column::from_vec(children)
             .width(iced::Fill)
             .padding(m::CONVERSATION_PADDING);
@@ -589,7 +600,7 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
             let state = tree.state.downcast_mut::<HistoryViewport>();
             if scroll.value.y != self.geometry.translation {
                 let max_offset = (scroll.extent - scroll.viewport_height).max(0.0).round();
-                state.anchor = if scroll.value.y < max_offset {
+                state.anchor = if scroll.value.y < max_offset || source.state.has_newer_history() {
                     self.geometry
                         .anchor_at(source.state.messages(), scroll.value.y)
                 } else {
@@ -604,18 +615,29 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
                 shell.request_redraw();
                 return;
             }
-            // At the top edge another upward gesture may retry a failed page
-            // even when the scroll offset cannot change.
-            let wheel_at_edge = cursor.is_over(layout.bounds())
-                && matches!(event,
+            // A gesture toward a blocked edge can retry without moving the viewport.
+            let wheel_direction = if cursor.is_over(layout.bounds()) {
+                match event {
                     Event::Mouse(mouse::Event::WheelScrolled {
-                        delta: mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. }
-                    }) if *y > 0.0
-                )
-                && scroll.value.y <= scroll.viewport_height;
-            let direction = wheel_at_edge
-                .then_some(HistoryScrollDirection::Up)
-                .or(state.scroll_direction.take());
+                        delta:
+                            mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. },
+                    }) if *y > 0.0 && scroll.value.y <= scroll.viewport_height => {
+                        Some(HistoryScrollDirection::Up)
+                    }
+                    Event::Mouse(mouse::Event::WheelScrolled {
+                        delta:
+                            mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. },
+                    }) if *y < 0.0
+                        && scroll.extent - scroll.value.y <= 2.0 * scroll.viewport_height =>
+                    {
+                        Some(HistoryScrollDirection::Down)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let direction = wheel_direction.or(state.scroll_direction.take());
             let geometry = (
                 self.geometry.translation,
                 self.geometry.extent,
@@ -623,12 +645,13 @@ impl Widget<app::Message, Theme, Renderer> for History<'_> {
             );
             if state.reported != Some(geometry) || direction.is_some() {
                 state.reported = Some(geometry);
-                shell.publish(app::Message::HistoryScrolled {
+                shell.publish(app::Message::HistoryScrolled(app::HistoryViewport {
                     chat_id: source.chat.id,
                     offset_y: geometry.0,
-                    viewport_height: geometry.2,
+                    remaining_y: (geometry.1 - geometry.0 - geometry.2).max(0.0),
+                    height: geometry.2,
                     direction,
-                });
+                }));
             }
         }
         if matches!(event, Event::Window(window::Event::RedrawRequested(_)))

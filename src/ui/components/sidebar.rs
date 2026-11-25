@@ -24,15 +24,20 @@ pub(in crate::ui) fn view(state: &app::State, width: f32) -> Element<'_, app::Me
     }
     let list = scrollable(chats)
         .height(Length::Fill)
+        .id(app::CHAT_LIST_SCROLL_ID)
         .on_scroll(|viewport| {
             let offset_y = viewport.absolute_offset().y;
             let viewport_height = viewport.bounds().height;
             let remaining_y = viewport.content_bounds().height - viewport_height - offset_y;
-            app::Message::ChatsScrolled {
-                offset_y,
-                remaining_y,
-                viewport_height,
-            }
+            let row_height = m::CHAT_ROW_HEIGHT as f32;
+            let first = ((offset_y - f32::from(m::SIDEBAR_INSET)).max(0.0) / row_height) as usize;
+            app::Message::ChatsScrolled(app::ChatListViewport {
+                anchor: state.chats().get(first).map(|chat| chat.id),
+                inset: offset_y - first as f32 * row_height,
+                row_height,
+                near_start: offset_y <= viewport_height,
+                near_end: offset_y > 0.0 && remaining_y <= viewport_height,
+            })
         });
     container(list)
         .style(appearance::surface)

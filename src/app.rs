@@ -10,15 +10,18 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domain::{
-        AuthorizationState, BackendEvent, ChatMessage, ChatPageQuery, ChatSummary, DeleteScope,
-        MessageAction, MessageActions, MessageAddress, MessagePreview, MessageReply, TextRun,
-        TextStyle, conceal_spoilers,
+        AuthorizationState, BackendEvent, ChatMessage, ChatPageAnchor, ChatPageQuery, ChatSummary,
+        DeleteScope, HistoryEdge, MAX_PENDING_SENDS, MessageAction, MessageActions, MessageAddress,
+        MessagePreview, MessageReply, TextRun, TextStyle,
     },
     tg::{Adapter, AdapterCommandError},
 };
 
 const REPLY_LOOKUP_BATCH_SIZE: usize = 4;
 const CHAT_PAGE_SIZE: usize = 50;
+const CHAT_CACHE_LIMIT: usize = 150;
+pub(crate) const HISTORY_CACHE_LIMIT: usize = 250;
+pub(crate) const CHAT_LIST_SCROLL_ID: &str = "main-chats";
 pub(crate) const CHAT_HISTORY_SCROLL_ID: &str = "chat-history";
 pub(crate) const CHAT_COMPOSER_ID: &str = "chat-composer";
 
@@ -35,16 +38,22 @@ pub(crate) struct State {
     chats: Vec<ChatSummary>,
     chat_pages: ChatPages,
     open_chat_id: Option<i64>,
+    open_chat_summary: Option<ChatSummary>,
+    forward_chat_summary: Option<ChatSummary>,
     window_focused: bool,
     history_read: HistoryRead,
     read_in_flight: Option<PendingRead>,
     messages: Vec<ChatMessage>,
+    history_pins: Vec<ChatMessage>,
     history_loading: bool,
     history_error: Option<String>,
     has_older_messages: bool,
-    older_history_request: Option<u64>,
-    older_history_failed: bool,
+    has_newer_messages: bool,
+    history_request: Option<(u64, HistoryEdge)>,
+    history_failed: Option<HistoryEdge>,
+    history_viewport: Option<HistoryViewport>,
     history_end_revision: u64,
+    pending_sends: HashMap<i64, Option<i64>>,
     composer: text_editor::Content,
     next_temporary_message_id: i64,
     send_error: Option<String>,
@@ -61,6 +70,26 @@ pub(crate) struct State {
     forward_status: Option<String>,
 }
 
+/// Distances to the edges of the active history viewport.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoryViewport {
+    pub chat_id: i64,
+    pub offset_y: f32,
+    pub remaining_y: f32,
+    pub height: f32,
+    pub direction: Option<HistoryScrollDirection>,
+}
+
+impl HistoryViewport {
+    fn near(self, edge: HistoryEdge) -> bool {
+        self.height > 0.0
+            && match edge {
+                HistoryEdge::Older => self.offset_y <= self.height,
+                HistoryEdge::Newer => self.remaining_y <= self.height,
+            }
+    }
+}
+
 /// The message and window position of an open context menu.
 #[derive(Clone, Copy)]
 pub(crate) struct MessageMenu {
@@ -73,13 +102,32 @@ pub(crate) struct MessageMenu {
 #[derive(Default)]
 struct ChatPages {
     started: bool,
+    first_offset: usize,
     next_offset: usize,
     after: Option<i64>,
-    loaded_limit: usize,
     finished: bool,
-    pending: Option<ChatPageQuery>,
+    pending: Option<(ChatPageQuery, ChatPageKind)>,
+    viewport: Option<ChatListViewport>,
+    retry: Option<ChatPageKind>,
     refresh_required: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatPageKind {
+    Next,
+    Previous,
+    Refresh,
+}
+
+/// The first visible sidebar row and its position in the viewport.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChatListViewport {
+    pub anchor: Option<i64>,
+    pub inset: f32,
+    pub row_height: f32,
+    pub near_start: bool,
+    pub near_end: bool,
 }
 
 #[derive(Default)]
@@ -139,11 +187,7 @@ pub(crate) enum Message {
     LogOut,
     LogoutCommandSent(Result<(), AdapterCommandError>),
     OpenChat(i64),
-    ChatsScrolled {
-        offset_y: f32,
-        remaining_y: f32,
-        viewport_height: f32,
-    },
+    ChatsScrolled(ChatListViewport),
     RetryChatPage,
     ChatPageQueued {
         request_id: u64,
@@ -156,13 +200,8 @@ pub(crate) enum Message {
         result: Result<(), AdapterCommandError>,
     },
     ChatOpenCommandSent(Result<(), AdapterCommandError>),
-    HistoryScrolled {
-        chat_id: i64,
-        offset_y: f32,
-        viewport_height: f32,
-        direction: Option<HistoryScrollDirection>,
-    },
-    OlderMessagesCommandSent {
+    HistoryScrolled(HistoryViewport),
+    HistoryPageQueued {
         request_id: u64,
         result: Result<(), AdapterCommandError>,
     },
@@ -218,16 +257,22 @@ pub(crate) fn boot(
         chats: Vec::new(),
         chat_pages: ChatPages::default(),
         open_chat_id: None,
+        open_chat_summary: None,
+        forward_chat_summary: None,
         window_focused: false,
         history_read: HistoryRead::default(),
         read_in_flight: None,
         messages: Vec::new(),
+        history_pins: Vec::new(),
         history_loading: false,
         history_error: None,
         has_older_messages: false,
-        older_history_request: None,
-        older_history_failed: false,
+        has_newer_messages: false,
+        history_request: None,
+        history_failed: None,
+        history_viewport: None,
         history_end_revision: 0,
+        pending_sends: HashMap::new(),
         composer: text_editor::Content::new(),
         next_temporary_message_id: -1,
         send_error: None,
@@ -306,6 +351,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.chats.clear();
                 state.chat_pages = ChatPages::default();
                 state.open_chat_id = None;
+                state.open_chat_summary = None;
                 state.history_read = HistoryRead::default();
                 state.read_in_flight = None;
                 state.message_menu = None;
@@ -314,13 +360,18 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.pending_mutation = None;
                 state.message_action_error = None;
                 state.messages.clear();
+                state.history_pins.clear();
+                state.pending_sends.clear();
                 state.has_older_messages = false;
-                state.older_history_request = None;
-                state.older_history_failed = false;
+                state.has_newer_messages = false;
+                state.history_request = None;
+                state.history_failed = None;
+                state.history_viewport = None;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 state.reply_to = None;
                 state.forward_selection = None;
+                state.forward_chat_summary = None;
                 state.forward_pending = false;
                 state.forward_status = None;
                 let backend = state.backend.clone();
@@ -354,6 +405,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.logout_pending = false;
         }
         Message::BackendEvent(BackendEvent::ChatUpdated(chat)) => {
+            update_pinned_chat(state, &chat);
             if let Some(existing) = state
                 .chats
                 .iter_mut()
@@ -367,29 +419,51 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::BackendEvent(BackendEvent::ChatPageLoaded {
             request_id,
+            offset,
             next_offset,
             next_after,
             has_more,
             chats,
         }) => {
-            if let Some(query) = state
+            if let Some((_, kind)) = state
                 .chat_pages
                 .pending
-                .filter(|query| query.request_id == request_id)
+                .filter(|(query, _)| query.request_id == request_id)
             {
                 state.chat_pages.pending = None;
                 state.chat_pages.error = None;
-                state.chat_pages.next_offset = next_offset;
-                state.chat_pages.loaded_limit = state.chat_pages.loaded_limit.max(next_offset);
-                state.chat_pages.after = next_after;
-                state.chat_pages.finished =
-                    !has_more && (query.load_missing || state.chat_pages.finished);
-                if !query.load_missing {
-                    let open_chat_id = state.open_chat_id;
-                    let loaded_ids: HashSet<_> = chats.iter().map(|chat| chat.id).collect();
-                    state.chats.retain(|chat| {
-                        Some(chat.id) == open_chat_id || loaded_ids.contains(&chat.id)
-                    });
+                state.chat_pages.retry = None;
+                let viewport = state.chat_pages.viewport;
+                if state.chats.len() + chats.len() > CHAT_CACHE_LIMIT
+                    && viewport.is_some_and(|viewport| match kind {
+                        ChatPageKind::Next => !viewport.near_end,
+                        ChatPageKind::Previous => !viewport.near_start,
+                        ChatPageKind::Refresh => false,
+                    })
+                {
+                    return refresh_pending_chat_pages(state);
+                }
+                match kind {
+                    ChatPageKind::Next => {
+                        if state.chats.is_empty() {
+                            state.chat_pages.first_offset = offset;
+                        }
+                        state.chat_pages.next_offset = next_offset;
+                        state.chat_pages.after = next_after;
+                        state.chat_pages.finished = !has_more;
+                    }
+                    ChatPageKind::Previous => {
+                        state.chat_pages.first_offset = offset;
+                    }
+                    ChatPageKind::Refresh => {
+                        state.chat_pages.first_offset = offset;
+                        state.chat_pages.next_offset = next_offset;
+                        state.chat_pages.after = next_after;
+                        state.chat_pages.finished &= !has_more;
+                        state
+                            .chats
+                            .retain(|chat| chats.iter().any(|loaded| loaded.id == chat.id));
+                    }
                 }
                 for chat in chats {
                     if let Some(existing) = state
@@ -398,20 +472,40 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                         .find(|existing| existing.id == chat.id)
                     {
                         // Keep the live summary when an adjacent page overlaps.
-                        if !query.load_missing {
+                        if kind == ChatPageKind::Refresh {
                             update_chat_summary(existing, chat);
                         }
                     } else {
                         state.chats.push(chat);
                     }
                 }
+                if kind == ChatPageKind::Refresh {
+                    for chat in [
+                        &mut state.open_chat_summary,
+                        &mut state.forward_chat_summary,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if let Some(updated) = state.chats.iter().find(|entry| entry.id == chat.id)
+                        {
+                            update_chat_summary(chat, updated.clone());
+                        }
+                    }
+                }
                 sort_chats(&mut state.chats);
-                if state.chat_pages.refresh_required {
-                    return refresh_chat_pages(state);
-                }
-                if state.chats.len() < CHAT_PAGE_SIZE && has_more {
-                    return request_next_chat_page(state);
-                }
+                trim_chats(state, kind);
+                let follow_up = if state.chat_pages.refresh_required {
+                    refresh_chat_pages(state)
+                } else if state.chats.len() < CHAT_PAGE_SIZE
+                    && has_more
+                    && kind == ChatPageKind::Next
+                {
+                    request_next_chat_page(state)
+                } else {
+                    Task::none()
+                };
+                return Task::batch([restore_chat_scroll(state, viewport), follow_up]);
             }
         }
         Message::BackendEvent(BackendEvent::ChatPageFailed {
@@ -429,21 +523,21 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             last_read_message_id,
             unread_count,
         }) => {
-            if let Some(chat) = state.chats.iter_mut().find(|chat| chat.id == chat_id)
-                && last_read_message_id >= chat.last_read_inbox_message_id
-            {
-                chat.last_read_inbox_message_id = last_read_message_id;
-                chat.unread_count = unread_count;
+            for chat in state.chat_entries_mut(chat_id) {
+                if last_read_message_id >= chat.last_read_inbox_message_id {
+                    chat.last_read_inbox_message_id = last_read_message_id;
+                    chat.unread_count = unread_count;
+                }
             }
         }
         Message::BackendEvent(BackendEvent::ChatOutboxRead {
             chat_id,
             last_read_message_id,
         }) => {
-            if let Some(chat) = state.chats.iter_mut().find(|chat| chat.id == chat_id)
-                && let Some(read) = &mut chat.last_read_outbox_message_id
-            {
-                *read = (*read).max(last_read_message_id);
+            for chat in state.chat_entries_mut(chat_id) {
+                if let Some(read) = &mut chat.last_read_outbox_message_id {
+                    *read = (*read).max(last_read_message_id);
+                }
             }
         }
         Message::BackendEvent(BackendEvent::ReadReceiptFinished {
@@ -453,7 +547,23 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             return finish_read_receipt(state, request_id, accepted);
         }
         Message::BackendEvent(BackendEvent::ChatRemoved(chat_id)) => {
+            let before = state.chats.len();
             state.chats.retain(|chat| chat.id != chat_id);
+            if state.chats.len() < before
+                && state.chat_pages.next_offset > state.chat_pages.first_offset
+            {
+                state.chat_pages.next_offset -= 1;
+            }
+            if state
+                .forward_chat_summary
+                .as_ref()
+                .is_some_and(|chat| chat.id == chat_id)
+            {
+                state.forward_chat_summary = None;
+                if let Some(selection) = &mut state.forward_selection {
+                    selection.destination = None;
+                }
+            }
         }
         Message::BackendEvent(BackendEvent::ChatHistoryLoaded {
             chat_id,
@@ -462,35 +572,54 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         }) => {
             if state.open_chat_id == Some(chat_id) {
                 state.message_menu = None;
-                state.messages = messages;
+                merge_history_page(&mut state.messages, messages);
                 state.history_loading = false;
                 state.history_error = None;
                 state.has_older_messages = has_older_messages;
-                state.older_history_request = None;
-                state.older_history_failed = false;
+                state.has_newer_messages = false;
+                state.history_request = None;
+                state.history_failed = None;
+                state.history_viewport = None;
+                trim_history(state, HistoryEdge::Newer);
                 return refresh_reply_previews(state);
             }
         }
-        Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+        Message::BackendEvent(BackendEvent::HistoryPageLoaded {
             request_id,
             messages,
-            has_older_messages,
+            has_more,
         }) => {
-            if state.older_history_request == Some(request_id) {
-                state.older_history_request = None;
-                state.has_older_messages = has_older_messages;
+            if let Some((_, edge)) = state.history_request.filter(|(id, _)| *id == request_id) {
+                state.history_request = None;
                 state.history_error = None;
+                // If the user moved across the window while the request was in
+                // flight, leave that viewport intact and reload the page later.
+                if state.messages.len() + messages.len() > HISTORY_CACHE_LIMIT
+                    && state
+                        .history_viewport
+                        .is_some_and(|viewport| !viewport.near(edge))
+                {
+                    return Task::none();
+                }
+                match edge {
+                    HistoryEdge::Older => state.has_older_messages = has_more,
+                    HistoryEdge::Newer => state.has_newer_messages = has_more,
+                }
                 if !messages.is_empty() {
-                    prepend_messages(&mut state.messages, messages);
+                    state
+                        .history_pins
+                        .retain(|pin| messages.iter().all(|message| message.id != pin.id));
+                    merge_history_page(&mut state.messages, messages);
+                    trim_history(state, edge);
                     return refresh_reply_previews(state);
                 }
             }
         }
-        Message::BackendEvent(BackendEvent::OlderChatHistoryError {
+        Message::BackendEvent(BackendEvent::HistoryPageFailed {
             request_id,
             message,
         }) => {
-            fail_older_history(state, request_id, message);
+            fail_history_page(state, request_id, message);
         }
         Message::BackendEvent(BackendEvent::ChatHistoryError { chat_id, message }) => {
             if state.open_chat_id == Some(chat_id) {
@@ -500,7 +629,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::BackendEvent(BackendEvent::NewMessage { chat_id, message }) => {
             if state.open_chat_id == Some(chat_id) {
-                insert_message(&mut state.messages, message);
+                insert_live_message(state, message);
                 return refresh_reply_previews(state);
             }
         }
@@ -511,10 +640,13 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             message,
         }) => {
             if state.open_chat_id == Some(chat_id) {
+                if let Some(local_id) = local_message_id {
+                    state.pending_sends.remove(&local_id);
+                }
                 state.messages.retain(|existing| {
                     existing.id != old_message_id && Some(existing.id) != local_message_id
                 });
-                insert_message(&mut state.messages, message);
+                insert_live_message(state, message);
                 return refresh_reply_previews(state);
             }
         }
@@ -541,10 +673,22 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             text_runs,
             is_text,
         }) => {
-            if let Some(chat) = state.chats.iter_mut().find(|chat| {
-                chat.id == address.chat_id && chat.last_message_id == Some(address.message_id)
-            }) {
-                chat.last_message_preview = conceal_spoilers(&text, &text_runs).into_owned();
+            for chat in state
+                .chat_entries_mut(address.chat_id)
+                .filter(|chat| chat.last_message_id == Some(address.message_id))
+            {
+                chat.last_message_preview =
+                    MessagePreview::message_snippet(&text, &text_runs).into();
+            }
+            if !state.history_pins.is_empty() {
+                apply_message_content(
+                    &mut state.history_pins,
+                    state.open_chat_id,
+                    address,
+                    text.clone(),
+                    text_runs.clone(),
+                    is_text,
+                );
             }
             apply_message_content(
                 &mut state.messages,
@@ -560,6 +704,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 && let Some(message) = state
                     .messages
                     .iter_mut()
+                    .chain(&mut state.history_pins)
                     .find(|message| message.id == address.message_id)
             {
                 message.is_edited = true;
@@ -573,6 +718,12 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             message_ids.sort_unstable();
             let deleted = |id: i64| message_ids.binary_search(&id).is_ok();
             apply_message_deletion(&mut state.messages, state.open_chat_id, chat_id, deleted);
+            apply_message_deletion(
+                &mut state.history_pins,
+                state.open_chat_id,
+                chat_id,
+                deleted,
+            );
             if state.open_chat_id == Some(chat_id) {
                 if state
                     .message_menu
@@ -605,6 +756,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                     .is_some_and(|selection| deleted(selection.message_id))
                 {
                     state.forward_selection = None;
+                    state.forward_chat_summary = None;
                 }
             }
         }
@@ -628,6 +780,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.forward_status = Some(match result {
                 Ok(()) => {
                     state.forward_selection = None;
+                    state.forward_chat_summary = None;
                     "Message forwarded.".into()
                 }
                 Err(error) => error,
@@ -695,21 +848,23 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.authorization_error = Some(error.to_string());
         }
         Message::LogoutCommandSent(Ok(())) => {}
-        Message::ChatsScrolled {
-            offset_y,
-            remaining_y,
-            viewport_height,
-        } => {
-            if offset_y > 0.0 && remaining_y <= viewport_height && state.chat_pages.error.is_none()
-            {
-                return request_next_chat_page(state);
+        Message::ChatsScrolled(viewport) => {
+            state.chat_pages.viewport = Some(viewport);
+            if state.chat_pages.error.is_none() {
+                if viewport.near_start && state.chat_pages.first_offset > 0 {
+                    return request_previous_chat_page(state);
+                }
+                if viewport.near_end {
+                    return request_next_chat_page(state);
+                }
             }
         }
         Message::RetryChatPage => {
-            if state.chat_pages.refresh_required {
-                return refresh_chat_pages(state);
-            }
-            return request_next_chat_page(state);
+            return match state.chat_pages.retry {
+                Some(ChatPageKind::Previous) => request_previous_chat_page(state),
+                Some(ChatPageKind::Refresh) => refresh_chat_pages(state),
+                _ => request_next_chat_page(state),
+            };
         }
         Message::ChatPageQueued { request_id, result } => {
             if let Err(error) = result {
@@ -718,7 +873,10 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::OpenChat(chat_id) => {
             state.message_menu = None;
-            if state.open_chat_id != Some(chat_id) {
+            if state.open_chat_id != Some(chat_id)
+                || (state.history_error.is_some() && state.messages.is_empty())
+            {
+                state.open_chat_summary = state.chat(chat_id).cloned();
                 state.open_chat_id = Some(chat_id);
                 state.history_read = HistoryRead::default();
                 state.edit = None;
@@ -726,11 +884,16 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.message_action_error = None;
                 state.reply_to = None;
                 state.forward_selection = None;
+                state.forward_chat_summary = None;
                 state.forward_status = None;
                 state.messages.clear();
+                state.history_pins.clear();
+                state.pending_sends.clear();
                 state.has_older_messages = false;
-                state.older_history_request = None;
-                state.older_history_failed = false;
+                state.has_newer_messages = false;
+                state.history_request = None;
+                state.history_failed = None;
+                state.history_viewport = None;
                 state.composer = text_editor::Content::new();
                 state.send_error = None;
                 state.history_loading = true;
@@ -757,7 +920,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::HistoryReadBoundary(address) => {
-            if let Some(chat) = state.chats.iter().find(|chat| chat.id == address.chat_id)
+            if let Some(chat) = state.chat(address.chat_id)
                 && state
                     .read_after(chat)
                     .is_some_and(|after| address.message_id > after)
@@ -777,25 +940,23 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 return finish_read_receipt(state, request_id, false);
             }
         }
-        Message::HistoryScrolled {
-            chat_id,
-            offset_y,
-            viewport_height,
-            direction,
-        } => {
-            if state.open_chat_id == Some(chat_id) {
-                if direction.is_some() {
+        Message::HistoryScrolled(viewport) => {
+            if state.open_chat_id == Some(viewport.chat_id) {
+                state.history_viewport = Some(viewport);
+                if viewport.direction.is_some() {
                     state.message_menu = None;
                 }
-                if viewport_height > 0.0 && offset_y <= viewport_height {
-                    let retry = direction == Some(HistoryScrollDirection::Up);
-                    return request_older_history(state, chat_id, retry);
+                if viewport.near(HistoryEdge::Older) && state.has_older_messages {
+                    return request_history_page(state, viewport, HistoryEdge::Older);
+                }
+                if viewport.near(HistoryEdge::Newer) && state.has_newer_messages {
+                    return request_history_page(state, viewport, HistoryEdge::Newer);
                 }
             }
         }
-        Message::OlderMessagesCommandSent { request_id, result } => {
+        Message::HistoryPageQueued { request_id, result } => {
             if let Err(error) = result {
-                fail_older_history(state, request_id, error.to_string());
+                fail_history_page(state, request_id, error.to_string());
             }
         }
         Message::ComposerAction(action) => {
@@ -970,10 +1131,11 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::SelectForwardDestination(chat_id) => {
-            if state.can_forward_to(chat_id)
-                && let Some(selection) = &mut state.forward_selection
-            {
-                selection.destination = Some(chat_id);
+            if state.can_forward_to(chat_id) && state.forward_selection.is_some() {
+                state.forward_chat_summary = state.chat(chat_id).cloned();
+                if let Some(selection) = &mut state.forward_selection {
+                    selection.destination = Some(chat_id);
+                }
                 state.forward_status = None;
             }
         }
@@ -1001,6 +1163,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::CancelForward => {
             state.forward_selection = None;
+            state.forward_chat_summary = None;
             state.forward_status = None;
         }
         Message::ForwardQueued(result) => {
@@ -1039,6 +1202,10 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
                 };
                 return start_message_mutation(state, address, MessageAction::Edit(text));
             }
+            if state.pending_sends.len() >= MAX_PENDING_SENDS {
+                state.send_error = Some("Wait for earlier messages to finish sending.".into());
+                return Task::none();
+            }
             let reply = state.reply_message().map(|original| {
                 Box::new(MessageReply {
                     chat_id,
@@ -1055,8 +1222,28 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             state.reply_to = None;
             let message_id = state.next_temporary_message_id;
             state.next_temporary_message_id = state.next_temporary_message_id.saturating_sub(1);
-            insert_message(
-                &mut state.messages,
+            state.pending_sends.insert(message_id, reply_to);
+            let reload_history = state.has_newer_messages;
+            if reload_history {
+                let selected = history_pin_ids(state);
+                state.history_pins.retain(|pin| selected.contains(&pin.id));
+                for message in std::mem::take(&mut state.messages) {
+                    if state.pending_sends.contains_key(&message.id) {
+                        state.messages.push(message);
+                    } else if selected.contains(&message.id) {
+                        state.history_pins.push(message);
+                    }
+                }
+                state.history_loading = true;
+                state.history_error = None;
+                state.has_older_messages = false;
+                state.has_newer_messages = false;
+                state.history_request = None;
+                state.history_failed = None;
+            }
+            state.history_viewport = None;
+            insert_live_message(
+                state,
                 ChatMessage {
                     id: message_id,
                     date: current_unix_timestamp(),
@@ -1078,9 +1265,16 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             let backend = state.backend.clone();
             return Task::perform(
                 async move {
-                    let result = backend
-                        .send_text(chat_id, message_id, text.clone(), reply_to)
-                        .await;
+                    let result = async {
+                        backend
+                            .send_text(chat_id, message_id, text.clone(), reply_to)
+                            .await?;
+                        if reload_history {
+                            backend.open_chat(chat_id).await?;
+                        }
+                        Ok(())
+                    }
+                    .await;
                     (chat_id, message_id, text, result)
                 },
                 |(chat_id, message_id, text, result)| Message::SendMessageCommandSent {
@@ -1100,6 +1294,7 @@ pub(crate) fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Err(error) = result
                 && state.open_chat_id == Some(chat_id)
             {
+                state.history_loading = false;
                 restore_rejected_message(state, message_id, &text);
                 state.send_error = Some(error.to_string());
             }
@@ -1117,7 +1312,10 @@ fn sort_chats(chats: &mut [ChatSummary]) {
 }
 
 fn add_live_chat(state: &mut State, chat: ChatSummary) {
-    let limit = state.chat_pages.loaded_limit;
+    let limit = state
+        .chat_pages
+        .next_offset
+        .saturating_sub(state.chat_pages.first_offset);
     if !state.chat_pages.finished
         && !state
             .chats
@@ -1128,19 +1326,23 @@ fn add_live_chat(state: &mut State, chat: ChatSummary) {
     {
         return;
     }
+    if state.chat_pages.first_offset > 0
+        && state
+            .chats
+            .first()
+            .is_some_and(|first| (chat.position, chat.id) > (first.position, first.id))
+    {
+        state.chat_pages.first_offset += 1;
+        state.chat_pages.next_offset += 1;
+        return;
+    }
     state.chats.push(chat);
     sort_chats(&mut state.chats);
-    if !state.chat_pages.finished && state.chats.len() > limit {
-        let open_chat = state.open_chat_id;
-        let destination = state
-            .forward_selection
-            .as_ref()
-            .and_then(|selection| selection.destination);
-        let mut rank = 0;
-        state.chats.retain(|chat| {
-            rank += 1;
-            rank <= limit || Some(chat.id) == open_chat || Some(chat.id) == destination
-        });
+    if state.chat_pages.finished {
+        state.chat_pages.next_offset += 1;
+        trim_chats(state, ChatPageKind::Previous);
+    } else {
+        state.chats.truncate(limit.min(CHAT_CACHE_LIMIT));
     }
 }
 
@@ -1159,38 +1361,124 @@ fn update_chat_summary(existing: &mut ChatSummary, mut incoming: ChatSummary) {
     *existing = incoming;
 }
 
+fn update_pinned_chat(state: &mut State, incoming: &ChatSummary) {
+    for selected in state
+        .open_chat_summary
+        .iter_mut()
+        .chain(&mut state.forward_chat_summary)
+    {
+        if selected.id == incoming.id {
+            update_chat_summary(selected, incoming.clone());
+        }
+    }
+}
+
+fn trim_chats(state: &mut State, arrival: ChatPageKind) {
+    let excess = state.chats.len().saturating_sub(CHAT_CACHE_LIMIT);
+    if excess == 0 {
+        return;
+    }
+    if arrival == ChatPageKind::Next {
+        state.chats.drain(..excess);
+        state.chat_pages.first_offset += excess;
+    } else {
+        state.chats.truncate(CHAT_CACHE_LIMIT);
+        state.chat_pages.next_offset = state.chat_pages.next_offset.saturating_sub(excess);
+        state.chat_pages.after = state.chats.last().map(|chat| chat.id);
+        state.chat_pages.finished = false;
+    }
+}
+
+fn restore_chat_scroll(state: &State, viewport: Option<ChatListViewport>) -> Task<Message> {
+    let Some(viewport) = viewport else {
+        return Task::none();
+    };
+    let Some(index) = state
+        .chats
+        .iter()
+        .position(|chat| Some(chat.id) == viewport.anchor)
+    else {
+        return Task::none();
+    };
+    iced::widget::operation::scroll_to(
+        CHAT_LIST_SCROLL_ID,
+        iced::widget::operation::AbsoluteOffset {
+            x: 0.0,
+            y: index as f32 * viewport.row_height + viewport.inset,
+        },
+    )
+}
+
 fn request_next_chat_page(state: &mut State) -> Task<Message> {
     if state.chat_pages.finished {
         return Task::none();
     }
-    let offset = state.chat_pages.next_offset;
-    let after = state.chat_pages.after;
-    request_chat_page(state, offset, CHAT_PAGE_SIZE, after, true)
+    request_chat_page(
+        state,
+        state.chat_pages.next_offset,
+        CHAT_PAGE_SIZE,
+        state
+            .chat_pages
+            .after
+            .or_else(|| state.chats.last().map(|chat| chat.id))
+            .map(ChatPageAnchor::After),
+        ChatPageKind::Next,
+    )
+}
+
+fn request_previous_chat_page(state: &mut State) -> Task<Message> {
+    let offset = state.chat_pages.first_offset;
+    if offset == 0 {
+        return Task::none();
+    }
+    request_chat_page(
+        state,
+        offset.saturating_sub(CHAT_PAGE_SIZE),
+        offset.min(CHAT_PAGE_SIZE),
+        state
+            .chats
+            .first()
+            .map(|chat| ChatPageAnchor::Before(chat.id)),
+        ChatPageKind::Previous,
+    )
+}
+
+fn refresh_pending_chat_pages(state: &mut State) -> Task<Message> {
+    if state.chat_pages.refresh_required {
+        refresh_chat_pages(state)
+    } else {
+        Task::none()
+    }
 }
 
 fn refresh_chat_pages(state: &mut State) -> Task<Message> {
     if state.chat_pages.pending.is_some() {
         return Task::none();
     }
-    let count = state.chat_pages.next_offset;
+    let offset = state.chat_pages.first_offset;
+    let count = state
+        .chat_pages
+        .next_offset
+        .saturating_sub(offset)
+        .min(CHAT_CACHE_LIMIT);
+    state.chat_pages.refresh_required = false;
     if count == 0 {
-        state.chat_pages.refresh_required = false;
         return Task::none();
     }
-    state.chat_pages.refresh_required = false;
-    request_chat_page(state, 0, count, None, false)
+    request_chat_page(state, offset, count, None, ChatPageKind::Refresh)
 }
 
 fn request_chat_page(
     state: &mut State,
     offset: usize,
     limit: usize,
-    after: Option<i64>,
-    load_missing: bool,
+    anchor: Option<ChatPageAnchor>,
+    kind: ChatPageKind,
 ) -> Task<Message> {
     if state.chat_pages.pending.is_some()
         || state.logout_pending
         || state.authorization_state != Some(AuthorizationState::Ready)
+        || state.logout_pending
     {
         return Task::none();
     }
@@ -1199,11 +1487,11 @@ fn request_chat_page(
         request_id,
         offset,
         limit,
-        after,
-        load_missing,
+        anchor,
+        load_missing: kind == ChatPageKind::Next,
     };
     state.chat_pages.started = true;
-    state.chat_pages.pending = Some(query);
+    state.chat_pages.pending = Some((query, kind));
     state.chat_pages.error = None;
     let backend = state.backend.clone();
     Task::perform(
@@ -1213,62 +1501,71 @@ fn request_chat_page(
 }
 
 fn fail_chat_page(state: &mut State, request_id: u64, message: String) {
-    if let Some(query) = state
+    if let Some((_, kind)) = state
         .chat_pages
         .pending
-        .filter(|query| query.request_id == request_id)
+        .filter(|(query, _)| query.request_id == request_id)
     {
         state.chat_pages.pending = None;
-        state.chat_pages.refresh_required |= !query.load_missing;
+        state.chat_pages.retry = Some(kind);
         state.chat_pages.error = Some(message);
     }
 }
 
-fn request_older_history(state: &mut State, chat_id: i64, retry: bool) -> Task<Message> {
-    if !state.has_older_messages
-        || state.older_history_request.is_some()
-        || (state.older_history_failed && !retry)
+fn request_history_page(
+    state: &mut State,
+    viewport: HistoryViewport,
+    edge: HistoryEdge,
+) -> Task<Message> {
+    if state.history_request.is_some()
+        || state.history_loading
+        || state.logout_pending
+        || (state.history_failed == Some(edge)
+            && viewport.direction
+                != Some(match edge {
+                    HistoryEdge::Older => HistoryScrollDirection::Up,
+                    HistoryEdge::Newer => HistoryScrollDirection::Down,
+                }))
     {
         return Task::none();
     }
-    let Some(before_message_id) = state
+    let ids = state
         .messages
         .iter()
         .filter(|message| message.can_reference && message.id > 0)
-        .map(|message| message.id)
-        .min()
-    else {
+        .map(|message| message.id);
+    let boundary = match edge {
+        HistoryEdge::Older => ids.min(),
+        HistoryEdge::Newer => ids.max(),
+    };
+    let Some(boundary) = boundary else {
         return Task::none();
     };
     let request_id = state.action_request_id();
-    state.older_history_request = Some(request_id);
-    state.older_history_failed = false;
+    state.history_request = Some((request_id, edge));
+    state.history_failed = None;
     state.history_error = None;
     let backend = state.backend.clone();
     Task::perform(
         async move {
             backend
-                .load_older_messages(chat_id, before_message_id, request_id)
+                .load_history_page(viewport.chat_id, boundary, edge, request_id)
                 .await
         },
-        move |result| Message::OlderMessagesCommandSent { request_id, result },
+        move |result| Message::HistoryPageQueued { request_id, result },
     )
 }
 
-fn fail_older_history(state: &mut State, request_id: u64, message: String) {
-    if state.older_history_request == Some(request_id) {
-        state.older_history_request = None;
-        state.older_history_failed = true;
+fn fail_history_page(state: &mut State, request_id: u64, message: String) {
+    if let Some((_, edge)) = state.history_request.filter(|(id, _)| *id == request_id) {
+        state.history_request = None;
+        state.history_failed = Some(edge);
         state.history_error = Some(message);
     }
 }
 
 fn request_read_receipt(state: &mut State) -> Task<Message> {
-    let Some(chat) = state
-        .chats
-        .iter()
-        .find(|chat| Some(chat.id) == state.open_chat_id)
-    else {
+    let Some(chat) = state.open_chat_id.and_then(|id| state.chat(id)) else {
         return Task::none();
     };
     let message_id = state.history_read.viewed_through;
@@ -1573,13 +1870,9 @@ fn apply_reply_previews(
 }
 
 fn restore_rejected_message(state: &mut State, message_id: i64, text: &str) {
+    let reply_to = state.pending_sends.remove(&message_id).flatten();
     if state.edit.is_none() && state.composer.text().is_empty() && state.reply_to.is_none() {
-        state.reply_to = state
-            .messages
-            .iter()
-            .find(|message| message.id == message_id)
-            .and_then(|message| message.reply.as_ref())
-            .map(|reply| reply.message_id);
+        state.reply_to = reply_to;
         state.composer = text_editor::Content::with_text(text);
     }
     state.messages.retain(|message| message.id != message_id);
@@ -1597,7 +1890,7 @@ fn insert_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
     messages.sort_by_key(|message| (message.date, message.id));
 }
 
-fn prepend_messages(existing: &mut Vec<ChatMessage>, older: Vec<ChatMessage>) {
+fn merge_history_page(existing: &mut Vec<ChatMessage>, older: Vec<ChatMessage>) {
     let mut known_ids: HashSet<_> = existing.iter().map(|message| message.id).collect();
     let mut combined = Vec::with_capacity(existing.len() + older.len());
     combined.extend(
@@ -1608,6 +1901,67 @@ fn prepend_messages(existing: &mut Vec<ChatMessage>, older: Vec<ChatMessage>) {
     combined.append(existing);
     combined.sort_by_key(|message| (message.date, message.id));
     *existing = combined;
+}
+
+fn history_pin_ids(state: &State) -> Vec<i64> {
+    [
+        state.reply_to,
+        state.edit.as_ref().map(|edit| edit.message_id),
+        state
+            .forward_selection
+            .as_ref()
+            .map(|selection| selection.message_id),
+        state
+            .delete_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.message_id),
+    ]
+    .into_iter()
+    .chain(state.pending_sends.values().copied())
+    .flatten()
+    .collect()
+}
+
+fn trim_history(state: &mut State, arrival: HistoryEdge) {
+    let excess = state.messages.len().saturating_sub(HISTORY_CACHE_LIMIT);
+    if excess == 0 {
+        return;
+    }
+    let selected = history_pin_ids(state);
+    let keep = |message: &ChatMessage| selected.contains(&message.id);
+    state.history_pins.retain(keep);
+    let evicted = match arrival {
+        HistoryEdge::Older => {
+            state.has_newer_messages = true;
+            state.messages.drain(HISTORY_CACHE_LIMIT..)
+        }
+        HistoryEdge::Newer => {
+            state.has_older_messages = true;
+            state.messages.drain(..excess)
+        }
+    };
+    state.history_pins.extend(evicted.filter(keep));
+}
+
+fn insert_live_message(state: &mut State, message: ChatMessage) {
+    if state
+        .messages
+        .iter()
+        .any(|existing| existing.id == message.id)
+    {
+        insert_message(&mut state.messages, message);
+    } else if !state.has_newer_messages {
+        if state.messages.len() >= HISTORY_CACHE_LIMIT
+            && state
+                .history_viewport
+                .is_some_and(|viewport| viewport.near(HistoryEdge::Older))
+        {
+            state.has_newer_messages = true;
+        } else {
+            insert_message(&mut state.messages, message);
+            trim_history(state, HistoryEdge::Newer);
+        }
+    }
 }
 
 fn current_unix_timestamp() -> i32 {
@@ -1641,6 +1995,22 @@ impl State {
     pub(crate) fn chats(&self) -> &[ChatSummary] {
         &self.chats
     }
+    pub(crate) fn chat(&self, id: i64) -> Option<&ChatSummary> {
+        self.chats
+            .iter()
+            .chain(&self.open_chat_summary)
+            .chain(&self.forward_chat_summary)
+            .find(|chat| chat.id == id)
+    }
+
+    fn chat_entries_mut(&mut self, id: i64) -> impl Iterator<Item = &mut ChatSummary> {
+        self.chats
+            .iter_mut()
+            .chain(&mut self.open_chat_summary)
+            .chain(&mut self.forward_chat_summary)
+            .filter(move |chat| chat.id == id)
+    }
+
     pub(crate) fn chat_page_loading(&self) -> bool {
         self.chat_pages.pending.is_some()
     }
@@ -1687,8 +2057,14 @@ impl State {
     pub(crate) fn history_loading(&self) -> bool {
         self.history_loading
     }
-    pub(crate) fn loading_older_history(&self) -> bool {
-        self.older_history_request.is_some()
+    pub(crate) fn history_page_edge(&self) -> Option<HistoryEdge> {
+        self.history_request
+            .map(|(_, edge)| edge)
+            .or(self.history_failed)
+    }
+
+    pub(crate) fn has_newer_history(&self) -> bool {
+        self.has_newer_messages
     }
     pub(crate) fn history_error(&self) -> Option<&str> {
         self.history_error.as_deref()
@@ -1696,9 +2072,10 @@ impl State {
     pub(crate) fn history_end_revision(&self) -> u64 {
         self.history_end_revision
     }
-    fn referenceable_message(&self, message_id: i64) -> Option<&ChatMessage> {
+    pub(crate) fn referenceable_message(&self, message_id: i64) -> Option<&ChatMessage> {
         self.messages
             .iter()
+            .chain(&self.history_pins)
             .find(|message| message.id == message_id && message.can_reference)
     }
     fn action_request_id(&mut self) -> u64 {
@@ -1736,9 +2113,8 @@ impl State {
         !self.forward_pending
             && self.open_chat_id != Some(chat_id)
             && self
-                .chats
-                .iter()
-                .any(|chat| chat.id == chat_id && chat.can_receive_forwards)
+                .chat(chat_id)
+                .is_some_and(|chat| chat.can_receive_forwards)
     }
     pub(crate) fn forward_pending(&self) -> bool {
         self.forward_pending
@@ -1757,13 +2133,15 @@ impl State {
 #[cfg(test)]
 pub(crate) fn visual_history_page(state: &mut State, messages: Vec<ChatMessage>) {
     let request_id = state.action_request_id();
-    state.older_history_request = Some(request_id);
+    // Headless fixtures can model longer histories than the runtime cache.
+    merge_history_page(&mut state.messages, messages);
+    state.history_request = Some((request_id, HistoryEdge::Older));
     drop(update(
         state,
-        Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+        Message::BackendEvent(BackendEvent::HistoryPageLoaded {
             request_id,
-            messages,
-            has_older_messages: true,
+            messages: Vec::new(),
+            has_more: true,
         }),
     ));
 }
@@ -1815,6 +2193,183 @@ mod tests {
     }
 
     #[test]
+    fn history_window_evicts_both_edges_and_pins_an_active_reply() {
+        let limit = HISTORY_CACHE_LIMIT as i64;
+        let mut state = visual_fixture(
+            crate::config::ColorScheme::Light,
+            vec![unread_chat(10), unread_chat(11)],
+            (51..=50 + limit).map(message).collect(),
+        );
+        state.reply_to = Some(50 + limit);
+        state.has_older_messages = true;
+        let viewport = |offset_y, remaining_y| {
+            Message::HistoryScrolled(HistoryViewport {
+                chat_id: 10,
+                offset_y,
+                remaining_y,
+                height: 500.0,
+                direction: Some(HistoryScrollDirection::Up),
+            })
+        };
+
+        drop(update(&mut state, viewport(10.0, 5000.0)));
+        let (request_id, edge) = state.history_request.unwrap();
+        assert_eq!(edge, HistoryEdge::Older);
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::HistoryPageLoaded {
+                request_id,
+                messages: (1..=50).map(message).collect(),
+                has_more: false,
+            }),
+        ));
+        assert!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .eq(1..=limit)
+        );
+        assert_eq!(state.reply_message().unwrap().id, 50 + limit);
+        assert!(state.has_newer_messages);
+
+        insert_live_message(&mut state, message(limit + 51));
+        assert_eq!(state.messages.len(), HISTORY_CACHE_LIMIT);
+        drop(update(&mut state, viewport(5000.0, 10.0)));
+        let (request_id, edge) = state.history_request.unwrap();
+        assert_eq!(edge, HistoryEdge::Newer);
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::HistoryPageLoaded {
+                request_id,
+                messages: (limit + 1..=limit + 50).map(message).collect(),
+                has_more: true,
+            }),
+        ));
+        assert!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .eq(51..=limit + 50)
+        );
+        assert!(state.has_older_messages);
+        assert!(state.history_pins.is_empty());
+
+        drop(update(&mut state, Message::OpenChat(11)));
+        assert!(state.messages.is_empty() && state.history_pins.is_empty());
+        assert!(!state.has_newer_messages);
+    }
+
+    #[test]
+    fn sending_from_an_evicted_history_reopens_the_latest_page() {
+        let mut state = visual_fixture(
+            crate::config::ColorScheme::Light,
+            vec![unread_chat(10)],
+            (1..=HISTORY_CACHE_LIMIT as i64).map(message).collect(),
+        );
+        state.has_newer_messages = true;
+        state.composer = text_editor::Content::with_text("Sent from older history");
+        state.reply_to = Some(100);
+        let revision = state.history_end_revision;
+        drop(update(&mut state, Message::Submit));
+        assert_eq!(state.history_end_revision, revision + 1);
+        assert!(!state.has_newer_messages);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].text, "Sent from older history");
+        let pending_id = state.messages[0].id;
+
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::ChatHistoryLoaded {
+                chat_id: 10,
+                messages: (351..=400).map(message).collect(),
+                has_older_messages: true,
+            }),
+        ));
+        assert!(
+            state.messages[..50]
+                .iter()
+                .map(|entry| entry.id)
+                .eq(351..=400)
+        );
+        assert_eq!(state.messages.last().unwrap().id, pending_id);
+        assert!(!state.history_loading);
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::MessageSendRejected {
+                chat_id: 10,
+                message_id: pending_id,
+                text: "Sent from older history".into(),
+                reason: "Send failed".into(),
+            }),
+        ));
+        assert_eq!(state.composer.text(), "Sent from older history");
+        assert_eq!(state.reply_message().unwrap().id, 100);
+    }
+
+    #[test]
+    fn dialog_window_loads_evicted_pages_and_keeps_the_open_chat() {
+        let ranked = |id: i64| {
+            let mut chat = unread_chat(id);
+            chat.position = 1000 - id;
+            chat
+        };
+        let limit = CHAT_CACHE_LIMIT as i64;
+        let mut state = visual_fixture(
+            crate::config::ColorScheme::Light,
+            (1..=limit).map(ranked).collect(),
+            Vec::new(),
+        );
+        state.open_chat_summary = Some(ranked(1));
+        state.chat_pages.started = true;
+        state.chat_pages.next_offset = CHAT_CACHE_LIMIT;
+        let viewport = |anchor, near_start, near_end| {
+            Message::ChatsScrolled(ChatListViewport {
+                anchor: Some(anchor),
+                inset: 25.0,
+                row_height: 60.0,
+                near_start,
+                near_end,
+            })
+        };
+        drop(update(&mut state, viewport(limit - 4, false, true)));
+        let (next, _) = state.chat_pages.pending.unwrap();
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::ChatPageLoaded {
+                request_id: next.request_id,
+                offset: CHAT_CACHE_LIMIT,
+                next_offset: CHAT_CACHE_LIMIT + CHAT_PAGE_SIZE,
+                next_after: Some(limit + 50),
+                has_more: true,
+                chats: (limit + 1..=limit + 50).map(ranked).collect(),
+            }),
+        ));
+        assert_eq!(state.chats.len(), CHAT_CACHE_LIMIT);
+        assert_eq!(state.chats[0].id, 51);
+        assert_eq!(state.chat(1).unwrap().id, 1);
+        drop(update(&mut state, viewport(53, true, false)));
+        let (previous, _) = state.chat_pages.pending.unwrap();
+        assert_eq!(previous.anchor, Some(ChatPageAnchor::Before(51)));
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::ChatPageLoaded {
+                request_id: previous.request_id,
+                offset: 0,
+                next_offset: CHAT_PAGE_SIZE,
+                next_after: Some(50),
+                has_more: true,
+                chats: (1..=50).map(ranked).collect(),
+            }),
+        ));
+        assert_eq!(state.chat_pages.first_offset, 0);
+        assert_eq!(state.chat_pages.next_offset, CHAT_CACHE_LIMIT);
+        assert_eq!(state.chats.len(), CHAT_CACHE_LIMIT);
+        assert_eq!(state.chats[0].id, 1);
+    }
+
+    #[test]
     fn main_list_fetches_next_page_on_scroll_and_preserves_rank_order() {
         let (mut state, _) = boot(Adapter::for_tests(), crate::config::ColorScheme::Light);
         drop(update(
@@ -1823,7 +2378,7 @@ mod tests {
                 AuthorizationState::Ready,
             )),
         ));
-        let first = state.chat_pages.pending.unwrap();
+        let first = state.chat_pages.pending.unwrap().0;
         assert_eq!((first.offset, first.limit), (0, CHAT_PAGE_SIZE));
         let ranked = |id: i64| {
             let mut chat = unread_chat(id);
@@ -1834,22 +2389,30 @@ mod tests {
             &mut state,
             Message::BackendEvent(BackendEvent::ChatPageLoaded {
                 request_id: first.request_id,
+                offset: 0,
                 next_offset: CHAT_PAGE_SIZE,
                 next_after: Some(50),
                 has_more: true,
                 chats: (1..=50).rev().map(ranked).collect(),
             }),
         ));
-        let scroll = |remaining_y| Message::ChatsScrolled {
-            offset_y: 300.0,
-            remaining_y,
-            viewport_height: 300.0,
+        let scroll = |remaining_y| {
+            Message::ChatsScrolled(ChatListViewport {
+                anchor: Some(45),
+                inset: 0.0,
+                row_height: 60.0,
+                near_start: false,
+                near_end: remaining_y <= 300.0,
+            })
         };
         drop(update(&mut state, scroll(500.0)));
         assert!(state.chat_pages.pending.is_none());
         drop(update(&mut state, scroll(299.0)));
-        let next = state.chat_pages.pending.unwrap();
-        assert_eq!((next.offset, next.after), (CHAT_PAGE_SIZE, Some(50)));
+        let next = state.chat_pages.pending.unwrap().0;
+        assert_eq!(
+            (next.offset, next.anchor),
+            (CHAT_PAGE_SIZE, Some(ChatPageAnchor::After(50)))
+        );
         drop(update(
             &mut state,
             Message::BackendEvent(BackendEvent::ChatPageFailed {
@@ -1860,9 +2423,12 @@ mod tests {
         drop(update(&mut state, scroll(0.0)));
         assert!(state.chat_pages.pending.is_none());
         drop(update(&mut state, Message::RetryChatPage));
-        let retry = state.chat_pages.pending.unwrap();
+        let retry = state.chat_pages.pending.unwrap().0;
         assert_ne!(retry.request_id, next.request_id);
-        assert_eq!((retry.offset, retry.after), (CHAT_PAGE_SIZE, Some(50)));
+        assert_eq!(
+            (retry.offset, retry.anchor),
+            (CHAT_PAGE_SIZE, Some(ChatPageAnchor::After(50)))
+        );
 
         let mut promoted = ranked(51);
         promoted.position = 250;
@@ -1882,6 +2448,7 @@ mod tests {
             &mut state,
             Message::BackendEvent(BackendEvent::ChatPageLoaded {
                 request_id: retry.request_id,
+                offset: CHAT_PAGE_SIZE,
                 next_offset: 52,
                 next_after: Some(52),
                 has_more: false,
@@ -1903,74 +2470,6 @@ mod tests {
     }
 
     #[test]
-    fn older_history_prefetch_retries_on_input_and_ignores_stale_results() {
-        let mut state = visual_fixture(
-            crate::config::ColorScheme::Light,
-            vec![unread_chat(10)],
-            vec![message(50)],
-        );
-        state.has_older_messages = true;
-        let scroll = |offset_y, direction| Message::HistoryScrolled {
-            chat_id: 10,
-            offset_y,
-            viewport_height: 300.0,
-            direction,
-        };
-        let up = Some(HistoryScrollDirection::Up);
-        let down = Some(HistoryScrollDirection::Down);
-        drop(update(&mut state, scroll(450.0, up)));
-        assert_eq!(state.older_history_request, None);
-        drop(update(&mut state, scroll(0.0, None)));
-        let first = state.older_history_request.unwrap();
-        drop(update(&mut state, scroll(0.0, up)));
-        assert_eq!(state.older_history_request, Some(first));
-        drop(update(
-            &mut state,
-            Message::BackendEvent(BackendEvent::OlderChatHistoryError {
-                request_id: first,
-                message: "Try again".into(),
-            }),
-        ));
-        drop(update(&mut state, scroll(0.0, None)));
-        drop(update(&mut state, scroll(0.0, down)));
-        assert_eq!(state.older_history_request, None);
-
-        drop(update(&mut state, scroll(0.0, up)));
-        let retry = state.older_history_request.unwrap();
-        assert_ne!(first, retry);
-        assert!(state.history_error().is_none());
-        for request_id in [first, retry] {
-            drop(update(
-                &mut state,
-                Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
-                    request_id,
-                    messages: vec![message(40)],
-                    has_older_messages: true,
-                }),
-            ));
-            if request_id == first {
-                assert_eq!(state.older_history_request, Some(retry));
-                assert_eq!(state.messages.len(), 1);
-            }
-        }
-        assert_eq!(state.messages.len(), 2);
-        assert!(state.has_older_messages);
-        assert!(state.history_error().is_none());
-        drop(update(&mut state, scroll(0.0, None)));
-        let next = state.older_history_request.unwrap();
-        drop(update(
-            &mut state,
-            Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
-                request_id: next,
-                messages: vec![],
-                has_older_messages: false,
-            }),
-        ));
-        drop(update(&mut state, scroll(0.0, up)));
-        assert_eq!(state.older_history_request, None);
-    }
-
-    #[test]
     fn switching_chats_discards_the_previous_history_page() {
         let mut state = visual_fixture(
             crate::config::ColorScheme::Light,
@@ -1978,14 +2477,17 @@ mod tests {
             vec![message(50)],
         );
         state.has_older_messages = true;
-        let scroll = |chat_id| Message::HistoryScrolled {
-            chat_id,
-            offset_y: 0.0,
-            viewport_height: 300.0,
-            direction: None,
+        let scroll = |chat_id| {
+            Message::HistoryScrolled(HistoryViewport {
+                chat_id,
+                offset_y: 0.0,
+                height: 300.0,
+                remaining_y: 1_500.0,
+                direction: None,
+            })
         };
         drop(update(&mut state, scroll(10)));
-        let previous = state.older_history_request.unwrap();
+        let (previous, _) = state.history_request.unwrap();
 
         drop(update(&mut state, Message::OpenChat(20)));
         drop(update(
@@ -1997,20 +2499,93 @@ mod tests {
             }),
         ));
         drop(update(&mut state, scroll(10)));
-        assert_eq!(state.older_history_request, None);
+        assert_eq!(state.history_request, None);
         drop(update(&mut state, scroll(20)));
-        let current = state.older_history_request.unwrap();
+        let current = state.history_request.unwrap();
         drop(update(
             &mut state,
-            Message::BackendEvent(BackendEvent::OlderChatHistoryLoaded {
+            Message::BackendEvent(BackendEvent::HistoryPageLoaded {
                 request_id: previous,
                 messages: vec![message(40)],
-                has_older_messages: false,
+                has_more: false,
             }),
         ));
-        assert_eq!(state.older_history_request, Some(current));
+        assert_eq!(state.history_request, Some(current));
         assert_eq!(state.messages, vec![message(60)]);
         assert!(state.has_older_messages);
+    }
+
+    #[test]
+    fn older_history_prefetch_retries_on_input_and_ignores_stale_results() {
+        let mut state = visual_fixture(
+            crate::config::ColorScheme::Light,
+            vec![unread_chat(10)],
+            vec![message(50)],
+        );
+        state.has_older_messages = true;
+        let scroll = |offset_y, direction| {
+            Message::HistoryScrolled(HistoryViewport {
+                chat_id: 10,
+                offset_y,
+                height: 300.0,
+                remaining_y: 0.0,
+                direction,
+            })
+        };
+        let up = Some(HistoryScrollDirection::Up);
+        drop(update(&mut state, scroll(450.0, up)));
+        assert_eq!(state.history_request, None);
+        drop(update(&mut state, scroll(0.0, None)));
+        let first = state.history_request.unwrap();
+        drop(update(&mut state, scroll(0.0, up)));
+        assert_eq!(state.history_request, Some(first));
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::HistoryPageFailed {
+                request_id: first.0,
+                message: "Try again".into(),
+            }),
+        ));
+        drop(update(&mut state, scroll(0.0, None)));
+        drop(update(
+            &mut state,
+            scroll(0.0, Some(HistoryScrollDirection::Down)),
+        ));
+        assert_eq!(state.history_request, None);
+
+        drop(update(&mut state, scroll(0.0, up)));
+        let retry = state.history_request.unwrap();
+        assert_ne!(first, retry);
+        assert!(state.history_error().is_none());
+        for request_id in [first, retry] {
+            drop(update(
+                &mut state,
+                Message::BackendEvent(BackendEvent::HistoryPageLoaded {
+                    request_id: request_id.0,
+                    messages: vec![message(40)],
+                    has_more: true,
+                }),
+            ));
+            if request_id == first {
+                assert_eq!(state.history_request, Some(retry));
+                assert_eq!(state.messages.len(), 1);
+            }
+        }
+        assert_eq!(state.messages.len(), 2);
+        assert!(state.has_older_messages);
+        assert!(state.history_error().is_none());
+        drop(update(&mut state, scroll(0.0, None)));
+        let next = state.history_request.unwrap();
+        drop(update(
+            &mut state,
+            Message::BackendEvent(BackendEvent::HistoryPageLoaded {
+                request_id: next.0,
+                messages: vec![],
+                has_more: false,
+            }),
+        ));
+        drop(update(&mut state, scroll(0.0, up)));
+        assert_eq!(state.history_request, None);
     }
 
     #[test]

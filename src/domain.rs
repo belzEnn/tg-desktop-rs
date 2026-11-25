@@ -42,6 +42,7 @@ pub enum BackendEvent {
     /// A ranked page of main-list summaries from the backend.
     ChatPageLoaded {
         request_id: u64,
+        offset: usize,
         next_offset: usize,
         next_after: Option<i64>,
         has_more: bool,
@@ -78,14 +79,14 @@ pub enum BackendEvent {
         messages: Vec<ChatMessage>,
         has_older_messages: bool,
     },
-    /// An older page of messages was loaded for the active chat.
-    OlderChatHistoryLoaded {
+    /// A history page was loaded for the active chat.
+    HistoryPageLoaded {
         request_id: u64,
         messages: Vec<ChatMessage>,
-        has_older_messages: bool,
+        has_more: bool,
     },
-    /// Loading an older page failed with a safe-to-display message.
-    OlderChatHistoryError {
+    /// Loading a history page failed with a safe-to-display message.
+    HistoryPageFailed {
         request_id: u64,
         message: String,
     },
@@ -155,9 +156,25 @@ pub(crate) struct ChatPageQuery {
     pub request_id: u64,
     pub offset: usize,
     pub limit: usize,
-    pub after: Option<i64>,
+    pub anchor: Option<ChatPageAnchor>,
     pub load_missing: bool,
 }
+
+/// Locates a chat page next to a known dialog in the live ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatPageAnchor {
+    Before(i64),
+    After(i64),
+}
+
+/// The side of the current message window to fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryEdge {
+    Older,
+    Newer,
+}
+
+pub(crate) const MAX_PENDING_SENDS: usize = 32;
 
 /// Identifies a message within its chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

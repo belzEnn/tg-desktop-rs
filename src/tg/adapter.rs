@@ -21,8 +21,8 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::domain::{
-    AuthorizationState, BackendEvent, ChatMessage, ChatPageQuery, DeleteScope, MessageAction,
-    MessageAddress,
+    AuthorizationState, BackendEvent, ChatMessage, ChatPageAnchor, ChatPageQuery, DeleteScope,
+    HistoryEdge, MAX_PENDING_SENDS, MessageAction, MessageAddress,
 };
 
 use super::mapping;
@@ -34,6 +34,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHAT_PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CHAT_HISTORY_LIMIT: usize = 50;
+const SENDER_NAME_CACHE_LIMIT: usize = 2 * CHAT_HISTORY_LIMIT;
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
 const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -72,9 +73,10 @@ enum BackendCommand {
         address: MessageAddress,
         request_id: u64,
     },
-    LoadOlderMessages {
+    LoadHistoryPage {
         chat_id: i64,
-        before_message_id: i64,
+        boundary: i64,
+        edge: HistoryEdge,
         request_id: u64,
     },
     SendText {
@@ -276,16 +278,18 @@ impl Adapter {
         .await
     }
 
-    /// Loads the messages before the oldest message currently shown in a chat.
-    pub(crate) async fn load_older_messages(
+    /// Fetches another page of the active chat on either side of its window.
+    pub(crate) async fn load_history_page(
         &self,
         chat_id: i64,
-        before_message_id: i64,
+        boundary: i64,
+        edge: HistoryEdge,
         request_id: u64,
     ) -> Result<(), AdapterCommandError> {
-        self.send_command(BackendCommand::LoadOlderMessages {
+        self.send_command(BackendCommand::LoadHistoryPage {
             chat_id,
-            before_message_id,
+            boundary,
+            edge,
             request_id,
         })
         .await
@@ -513,15 +517,27 @@ async fn run_supervisor(
                     if let Some((_, job)) = history_page_job.take() {
                         job.abort();
                     }
-                    open_chat_id = None;
-                    if let Err(error) = tdlib_rs::functions::open_chat(chat_id, client_id).await {
-                        let _ = events.send(BackendEvent::ChatHistoryError {
-                            chat_id,
-                            message: format!("Could not open chat (error {}).", error.code),
-                        }).await;
-                        continue;
+                    if open_chat_id != Some(chat_id) {
+                        if let Some(previous) = open_chat_id.take() {
+                            let _ = tokio::time::timeout(
+                                INITIALIZATION_TIMEOUT, tdlib_rs::functions::close_chat(previous, client_id),
+                            ).await;
+                            pending_message_ids.clear();
+                        }
+                        let opened = tokio::time::timeout(
+                            INITIALIZATION_TIMEOUT, tdlib_rs::functions::open_chat(chat_id, client_id),
+                        ).await;
+                        let failure = match opened {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(format!("Could not open chat (error {}).", error.code)),
+                            Err(_) => Some("Opening the chat timed out.".into()),
+                        };
+                        if let Some(message) = failure {
+                            let _ = events.send(BackendEvent::ChatHistoryError { chat_id, message }).await;
+                            continue;
+                        }
+                        open_chat_id = Some(chat_id);
                     }
-                    open_chat_id = Some(chat_id);
                     let result = tokio::time::timeout(
                         HISTORY_TIMEOUT, load_initial_history(chat_id, client_id),
                     ).await;
@@ -563,9 +579,9 @@ async fn run_supervisor(
                         }).await;
                     }
                 }
-                Some(BackendCommand::LoadOlderMessages { chat_id, before_message_id, request_id }) => {
+                Some(BackendCommand::LoadHistoryPage { chat_id, boundary, edge, request_id }) => {
                     if open_chat_id != Some(chat_id) || client_closed {
-                        let _ = events.send(BackendEvent::OlderChatHistoryError {
+                        let _ = events.send(BackendEvent::HistoryPageFailed {
                             request_id,
                             message: "The chat is no longer open.".into(),
                         }).await;
@@ -581,17 +597,25 @@ async fn run_supervisor(
                         job.abort();
                     }
                     let job = background_requests.spawn(
-                        load_older_history(chat_id, before_message_id, request_id, client_id),
+                        load_history_page(chat_id, boundary, edge, request_id, client_id),
                     );
                     history_page_job = Some((request_id, job));
                 }
                 Some(BackendCommand::SendText { chat_id, message_id, text, reply_to }) => {
+                    if open_chat_id == Some(chat_id) && pending_message_ids.len() >= MAX_PENDING_SENDS {
+                        let _ = events.send(BackendEvent::MessageSendRejected {
+                            chat_id, message_id, text, reason: "The message could not be queued.".into(),
+                        }).await;
+                        continue;
+                    }
                     let content = mapping::input_text_content(text.clone(), true);
                     match tdlib_rs::functions::send_message(
                         chat_id, None, reply_to.map(mapping::input_reply), None, content, client_id,
                     ).await {
                         Ok(tdlib_rs::enums::Message::Message(message)) => {
-                            pending_message_ids.insert((chat_id, message.id), (message_id, text));
+                            if open_chat_id == Some(chat_id) {
+                                pending_message_ids.insert((chat_id, message.id), (message_id, text));
+                            }
                         }
                         Err(error) => {
                             warn!(code = error.code, "Telegram rejected a text message");
@@ -705,6 +729,9 @@ async fn run_supervisor(
                     match update {
                         tdlib_rs::enums::Update::NewMessage(update) => {
                             let chat_id = update.message.chat_id;
+                            if open_chat_id != Some(chat_id) {
+                                continue;
+                            }
                             let mut message = map_message(update.message, client_id).await;
                             if let Some((id, _)) = pending_message_ids.get(&(chat_id, message.id)) {
                                 message.id = *id;
@@ -718,11 +745,13 @@ async fn run_supervisor(
                             let old_message_id = update.old_message_id;
                             let key = (chat_id, old_message_id);
                             let local_message_id = pending_message_ids.remove(&key).map(|(id, _)| id);
-                            let message = map_message(update.message, client_id).await;
-                            if events.send(BackendEvent::MessageSendSucceeded {
-                                chat_id, old_message_id, local_message_id, message,
-                            }).await.is_err() {
-                                break;
+                            if open_chat_id == Some(chat_id) {
+                                let message = map_message(update.message, client_id).await;
+                                if events.send(BackendEvent::MessageSendSucceeded {
+                                    chat_id, old_message_id, local_message_id, message,
+                                }).await.is_err() {
+                                    break;
+                                }
                             }
                             if pending_forward == Some(key) {
                                 pending_forward = None;
@@ -768,6 +797,12 @@ async fn run_supervisor(
                         let _ = events.send(BackendEvent::ForwardFinished {
                             result: Err("Telegram did not confirm whether the message was forwarded.".into()),
                             discarded_message: None,
+                        }).await;
+                    }
+                    for ((chat_id, _), (message_id, text)) in pending_message_ids.drain() {
+                        let _ = events.send(BackendEvent::MessageSendRejected {
+                            chat_id, message_id, text,
+                            reason: "Delivery was not confirmed. Check the chat before retrying.".into(),
                         }).await;
                     }
                     match tdlib_rs::functions::get_authorization_state(client_id).await {
@@ -873,32 +908,69 @@ async fn load_initial_history(
     Ok((messages, has_older_messages))
 }
 
-async fn load_older_history(
+async fn history_after(
     chat_id: i64,
-    before: i64,
+    after: i64,
+    client_id: i32,
+) -> Result<Vec<tdlib_rs::types::Message>, tdlib_rs::types::Error> {
+    let limit = CHAT_HISTORY_LIMIT as i32;
+    for _ in 0..2 {
+        let tdlib_rs::enums::Messages::Messages(page) = tdlib_rs::functions::get_chat_history(
+            chat_id,
+            after,
+            -limit,
+            limit + 1,
+            false,
+            client_id,
+        )
+        .await?;
+        let messages: Vec<_> = page
+            .messages
+            .into_iter()
+            .rev()
+            .flatten()
+            .filter(|message| message.id > after)
+            .take(CHAT_HISTORY_LIMIT)
+            .collect();
+        if !messages.is_empty() {
+            return Ok(messages);
+        }
+    }
+    Ok(Vec::new())
+}
+
+async fn load_history_page(
+    chat_id: i64,
+    boundary: i64,
+    edge: HistoryEdge,
     request_id: u64,
     client_id: i32,
 ) -> BackendEvent {
     match tokio::time::timeout(HISTORY_TIMEOUT, async {
-        let page = history_before(chat_id, before, CHAT_HISTORY_LIMIT, client_id).await?;
+        let page = match edge {
+            HistoryEdge::Older => {
+                history_before(chat_id, boundary, CHAT_HISTORY_LIMIT, client_id).await?
+            }
+            HistoryEdge::Newer => history_after(chat_id, boundary, client_id).await?,
+        };
         let mut messages = map_history_messages(page, client_id).await;
         messages.sort_by_key(|message| (message.date, message.id));
         Ok::<_, tdlib_rs::types::Error>(messages)
     })
     .await
     {
-        Ok(Ok(messages)) => BackendEvent::OlderChatHistoryLoaded {
+        Ok(Ok(messages)) => BackendEvent::HistoryPageLoaded {
             request_id,
-            has_older_messages: !messages.is_empty(),
+            has_more: !messages.is_empty(),
             messages,
         },
-        Ok(Err(error)) => BackendEvent::OlderChatHistoryError {
+        Ok(Err(error)) => BackendEvent::HistoryPageFailed {
             request_id,
-            message: format!("Could not load older messages (error {}).", error.code),
+            message: format!("Could not load messages (error {}).", error.code),
         },
-        Err(_) => BackendEvent::OlderChatHistoryError {
+        Err(_) => BackendEvent::HistoryPageFailed {
             request_id,
-            message: "Loading older messages timed out.".into(),
+            message: "Loading messages timed out.".into(),
         },
     }
 }
@@ -1060,7 +1132,9 @@ async fn cached_sender_name(
         return name.clone();
     }
     let name = resolve_sender_name(sender, client_id).await;
-    names.insert(sender, name.clone());
+    if names.len() < SENDER_NAME_CACHE_LIMIT {
+        names.insert(sender, name.clone());
+    }
     name
 }
 
@@ -1101,9 +1175,9 @@ async fn read_chat_page(
     let cached_ids = |limit| tdlib_rs::functions::get_chats(list.clone(), limit, client_id);
     let tdlib_rs::enums::Chats::Chats(mut snapshot) = cached_ids(limit).await?;
     let mut reached_end = false;
-    let mut offset = chat_page_offset(query, &snapshot.chat_ids);
-    let requested =
-        i32::try_from(offset.saturating_add(query.limit).saturating_add(1)).unwrap_or(i32::MAX);
+    let mut range = chat_page_range(query, &snapshot.chat_ids);
+    let requested = i32::try_from(range.start.saturating_add(query.limit).saturating_add(1))
+        .unwrap_or(i32::MAX);
     if query.load_missing && requested as usize > snapshot.chat_ids.len() {
         let missing = (requested as usize - snapshot.chat_ids.len()).min(query.limit);
         match tdlib_rs::functions::load_chats(list.clone(), missing as i32, client_id).await {
@@ -1113,13 +1187,11 @@ async fn read_chat_page(
         }
         let tdlib_rs::enums::Chats::Chats(current) = cached_ids(requested).await?;
         snapshot = current;
-        offset = chat_page_offset(query, &snapshot.chat_ids);
+        range = chat_page_range(query, &snapshot.chat_ids);
     }
     // A snapshot may shrink while a page is requested. Clamp to what exists.
-    offset = offset.min(snapshot.chat_ids.len());
-    let next_offset = offset
-        .saturating_add(query.limit)
-        .min(snapshot.chat_ids.len());
+    let offset = range.start.min(snapshot.chat_ids.len());
+    let next_offset = range.end.min(snapshot.chat_ids.len());
     if query.load_missing && !reached_end && next_offset == offset {
         return Ok(BackendEvent::ChatPageFailed {
             request_id: query.request_id,
@@ -1137,6 +1209,7 @@ async fn read_chat_page(
     }
     Ok(BackendEvent::ChatPageLoaded {
         request_id: query.request_id,
+        offset,
         next_offset,
         next_after: next_offset
             .checked_sub(1)
@@ -1146,11 +1219,21 @@ async fn read_chat_page(
     })
 }
 
-fn chat_page_offset(query: ChatPageQuery, ids: &[i64]) -> usize {
-    query
-        .after
-        .and_then(|after| ids.iter().position(|&id| id == after))
-        .map_or(query.offset, |position| query.offset.min(position + 1))
+fn chat_page_range(query: ChatPageQuery, ids: &[i64]) -> std::ops::Range<usize> {
+    let offset = match query.anchor {
+        Some(ChatPageAnchor::Before(anchor)) => {
+            if let Some(end) = ids.iter().position(|&id| id == anchor) {
+                return end.saturating_sub(query.limit)..end;
+            }
+            query.offset
+        }
+        Some(ChatPageAnchor::After(anchor)) => ids
+            .iter()
+            .position(|&id| id == anchor)
+            .map_or(query.offset, |position| query.offset.min(position + 1)),
+        None => query.offset,
+    };
+    offset..offset.saturating_add(query.limit)
 }
 
 async fn configure_tdlib(

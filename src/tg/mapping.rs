@@ -46,7 +46,7 @@ pub(super) fn chat(chat: &Chat, account_user_id: Option<i64>) -> Option<ChatSumm
         last_message_is_outgoing: last_message.is_some_and(|message| message.is_outgoing),
         last_message_preview: last_message.map_or_else(
             || "No messages yet".into(),
-            |message| preview_text(&message.content).into_owned(),
+            |message| MessagePreview::snippet(&preview_text(&message.content)).into(),
         ),
         unread_count: chat.unread_count.max(0) as u32,
         last_read_inbox_message_id: chat.last_read_inbox_message_id,

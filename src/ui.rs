@@ -37,9 +37,7 @@ pub fn run(backend: Adapter, scheme: ColorScheme) -> iced::Result {
 }
 
 fn workspace(state: &app::State) -> Element<'_, app::Message> {
-    let open_chat = state
-        .open_chat_id()
-        .and_then(|id| state.chats().iter().find(|chat| chat.id == id));
+    let open_chat = state.open_chat_id().and_then(|id| state.chat(id));
     let main = responsive(move |available| {
         let mut conversation = column![
             components::chat_header(state, open_chat),
@@ -65,10 +63,7 @@ fn workspace(state: &app::State) -> Element<'_, app::Message> {
             ))
             .push(overlay::delete_confirmation(
                 confirmation,
-                state
-                    .messages()
-                    .iter()
-                    .find(|message| message.id == confirmation.message_id),
+                state.referenceable_message(confirmation.message_id),
                 state.mutation_pending(),
                 state.message_action_error(),
             ));
